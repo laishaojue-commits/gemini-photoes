@@ -14,9 +14,13 @@
  *   GET  /health           — Daemon 健康检查
  */
 import { createServer } from 'node:http';
-import { handleAcquire, handleStatus, handleRelease, handleHealth } from './handlers.js';
-import { setTTL, cancelHeartbeat, setServer } from './lifecycle.js';
+import {
+  handleAcquire, handleStatus, handleRelease, handleHealth,
+  handleSessionAcquire, handleSessionRenew, handleSessionRelease,
+} from './handlers.js';
+import { setTTL, cancelHeartbeat, setServer, resetHeartbeat } from './lifecycle.js';
 import { terminateBrowser, onBrowserExit } from './engine.js';
+import { sessionLeaseManager } from './session-lease.js';
 import config from '../config.js';
 
 // ── 配置（统一从 config.js 读取） ──
@@ -24,12 +28,16 @@ const PORT = config.daemonPort;
 const TTL_MS = config.daemonTTL;
 
 setTTL(TTL_MS);
+sessionLeaseManager.setOnChange(() => resetHeartbeat());
 
 // ── 路由表 ──
 const routes = {
   'GET /browser/acquire': handleAcquire,
   'GET /browser/status': handleStatus,
   'POST /browser/release': handleRelease,
+  'POST /session/acquire': handleSessionAcquire,
+  'POST /session/renew': handleSessionRenew,
+  'POST /session/release': handleSessionRelease,
   'GET /health': handleHealth,
 };
 
@@ -49,7 +57,7 @@ const server = createServer((req, res) => {
   }
 });
 
-server.listen(PORT, () => {
+server.listen(PORT, '127.0.0.1', () => {
   // 注入 server 引用给 lifecycle，超时退出时优雅关闭 HTTP 服务
   setServer(server);
 
@@ -68,6 +76,9 @@ server.listen(PORT, () => {
   console.log(`[daemon]    GET  /browser/acquire  — 获取/启动浏览器`);
   console.log(`[daemon]    GET  /browser/status   — 查询浏览器状态`);
   console.log(`[daemon]    POST /browser/release  — 销毁浏览器`);
+  console.log(`[daemon]    POST /session/acquire — 获取 Gemini 页互斥 lease`);
+  console.log(`[daemon]    POST /session/renew   — 续租 Gemini 页互斥 lease`);
+  console.log(`[daemon]    POST /session/release  — 释放 Gemini 页互斥 lease`);
   console.log(`[daemon]    GET  /health           — 健康检查`);
 });
 

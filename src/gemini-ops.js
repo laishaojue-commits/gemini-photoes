@@ -11,6 +11,8 @@ import config from './config.js';
 import { mkdirSync, existsSync } from 'node:fs';
 import { resolve as pathResolve, normalize as pathNormalize } from 'node:path';
 import { removeWatermarkFromFile, removeWatermarkFromDataUrl } from './watermark-remover.js';
+import { findNewResponse, responseFingerprint } from './gemini-response.js';
+import { createDownloadLifecycle, createDownloadWorkspace } from './gemini-download.js';
 
 // ── Gemini 页面元素选择器 ──
 const SELECTORS = {
@@ -51,13 +53,13 @@ const SELECTORS = {
     'button[aria-label*="mode selector" i]',        // 英文 aria-label 兜底
     'button.mat-mdc-menu-trigger.input-area-switch',// class 组合兜底
   ],
-  /** 模型标签文本容器（读取当前选中的模型名，如 "Pro" / "Flash"） */
+  /** 模型标签文本容器（读取当前模型族与版本，如 "3.1 Pro" / "4 Argon"） */
   modelLabel: [
     '.picker-primary-text',                                              // 新 UI：直接定位 innerText
     '[data-test-id="logo-pill-label-container"] span',                   // 旧 UI：最内层 span
     'div.logo-pill-label-container span',                                // 旧 UI 兜底
   ],
-  /** 思考深度副标签（找到 = 扩展思考；找不到 = 标准思考） */
+  /** 当前思考等级副标签 */
   thinkingDepthLabel: [
     '.picker-secondary-text',
   ],
@@ -139,6 +141,70 @@ const SELECTORS = {
   ],
 };
 
+function parseModelLabel(raw = '') {
+  const label = String(raw).trim();
+  const mainLabel = label.split(/[（(]/, 1)[0].trim();
+  const lower = mainLabel.replace(/flash\s+lite/ig, 'flash-lite').toLowerCase();
+  let model = 'unknown';
+  if (/\bargon\b/i.test(lower)) model = 'argon';
+  else if (/\bpro\b/i.test(lower)) model = 'pro';
+  else if (/\bflash-lite\b/i.test(lower)) model = 'flash-lite';
+  else if (/\bflash\b/i.test(lower)) model = 'flash';
+
+  const familyToken = model === 'unknown' ? null : model;
+  const familyIndex = familyToken ? lower.indexOf(familyToken) : lower.length;
+  const versionMatches = familyToken ? [...mainLabel.slice(0, familyIndex).matchAll(/\d+(?:\.\d+)*/g)] : [];
+  const version = familyToken
+    ? versionMatches.at(-1)?.[0] || null
+    : mainLabel.match(/^\s*(?:gemini\s+)?(\d+(?:\.\d+)*)\b/i)?.[1] || null;
+  return { model, version, raw: label };
+}
+
+function compareModelVersions(left, right) {
+  const a = String(left || '').split('.').map(Number);
+  const b = String(right || '').split('.').map(Number);
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    const difference = (a[i] || 0) - (b[i] || 0);
+    if (difference !== 0) return difference;
+  }
+  return 0;
+}
+
+function normalizeModelTarget(target) {
+  const text = String(target || '').trim().toLowerCase().replace(/\s+/g, ' ');
+  if (text === 'latest' || text === 'newest') return 'latest';
+  const aliases = {
+    'flash lite': 'flash-lite',
+    'flashlite': 'flash-lite',
+    'flash_lite': 'flash-lite',
+    'gemini pro': 'pro',
+    'gemini flash': 'flash',
+  };
+  return aliases[text] || (['argon', 'pro', 'flash', 'flash-lite'].includes(parseModelLabel(text).model)
+    ? parseModelLabel(text).model
+    : null);
+}
+
+function normalizeThinkingLevel(level) {
+  const text = String(level || '').trim().toLowerCase();
+  if (['low', '低', '低点'].includes(text)) return 'low';
+  if (['medium', '中', '中等', 'standard', '标准'].includes(text)) return 'medium';
+  if (['high', '高', '高点', 'extended', '扩展'].includes(text)) return 'high';
+  return null;
+}
+
+function parseThinkingLabel(raw = '') {
+  const text = String(raw).trim().toLowerCase();
+  if (/^(?:low|低点|低)(?:$|[\s（(])/i.test(text)) return 'low';
+  if (/^(?:medium|mid|standard|中等|中|标准)(?:$|[\s（(])/i.test(text)) return 'medium';
+  if (/^(?:high|extended|高点|高|扩展)(?:$|[\s（(])/i.test(text)) return 'high';
+  return null;
+}
+
+function legacyThinkingLevel(level) {
+  return level === 'medium' ? 'standard' : level === 'high' ? 'extended' : null;
+}
+
 /**
  * 创建 GeminiOps 操控实例
  * @param {import('puppeteer-core').Page} page
@@ -155,10 +221,10 @@ export function createOps(page) {
 
     /**
      * 探测页面各元素是否就位
-     * @returns {Promise<{promptInput: boolean, actionBtnWrapper: boolean, newChatBtn: boolean, modelBtn: boolean, modelLabel: boolean, tempChatBtn: boolean, currentModel: string, status: object}>}
+     * @returns {Promise<{promptInput: boolean, actionBtnWrapper: boolean, newChatBtn: boolean, modelBtn: boolean, modelLabel: boolean, tempChatBtn: boolean, currentModel: string, status: object, page: object, evidence: object}>}
      */
     async probe() {
-      const [promptInput, actionBtnWrapper, newChatBtn, modelBtn, modelLabel, tempChatBtn, status, currentModelResult] = await Promise.all([
+      const [promptInput, actionBtnWrapper, newChatBtn, modelBtn, modelLabel, tempChatBtn, status, currentModelResult, pageInfo] = await Promise.all([
         op.locate(SELECTORS.promptInput),
         op.locate(SELECTORS.actionBtnWrapper),
         op.locate(SELECTORS.newChatBtn),
@@ -167,6 +233,54 @@ export function createOps(page) {
         op.locate(SELECTORS.tempChatBtn),
         this.getStatus(),
         this.getCurrentModel(),
+        op.query((editorSelectors) => {
+          const isVisible = (el) => {
+            if (!el) return false;
+            const rect = el.getBoundingClientRect?.();
+            if (!rect || rect.width <= 0 || rect.height <= 0) return false;
+            const style = getComputedStyle(el);
+            return style.display !== 'none' && style.visibility !== 'hidden';
+          };
+          let editorVisible = false;
+          for (const selector of editorSelectors) {
+            try {
+              if ([...document.querySelectorAll(selector)].some(isVisible)) {
+                editorVisible = true;
+                break;
+              }
+            } catch { /* Ignore unsupported selectors. */ }
+          }
+          const loginControls = [...document.querySelectorAll('a,button,[role="button"],input[type="submit"]')];
+          const loginButtonVisible = loginControls.some((el) => {
+            if (!isVisible(el)) return false;
+            const label = `${el.innerText || el.textContent || ''} ${el.getAttribute?.('aria-label') || ''} ${el.value || ''}`;
+            return /sign\s*in|log\s*in|登录|登入/i.test(label);
+          });
+          const visibleText = (document.body?.innerText || '').replace(/[\t\r\n ]+/g, ' ').trim();
+          let safeUrl = '';
+          let pageState = 'unsupported_ui';
+          try {
+            const url = new URL(location.href);
+            safeUrl = `${url.origin}${url.pathname}`;
+            if (url.hostname === 'accounts.google.com') {
+              pageState = /unknownerror/i.test(url.pathname) ? 'auth_error' : 'login_required';
+            } else if (loginButtonVisible || /sign\s*in|log\s*in|登录|登入/i.test(visibleText)) {
+              pageState = 'login_required';
+            } else if (editorVisible) {
+              pageState = 'ready';
+            } else if (url.hostname === 'gemini.google.com') {
+              pageState = 'page_not_ready';
+            }
+          } catch { /* Invalid or unavailable location. */ }
+          return {
+            url: safeUrl,
+            title: document.title || '',
+            visibleText: visibleText.slice(0, 600),
+            pageState,
+            loginButtonVisible,
+            editorVisible,
+          };
+        }, SELECTORS.promptInput),
       ]);
       return {
         promptInput: promptInput.found,
@@ -177,6 +291,16 @@ export function createOps(page) {
         tempChatBtn: tempChatBtn.found,
         currentModel: currentModelResult.ok ? currentModelResult.raw : '',
         status,
+        page: {
+          url: pageInfo.url,
+          title: pageInfo.title,
+          visibleText: pageInfo.visibleText,
+          state: pageInfo.pageState,
+        },
+        evidence: {
+          loginButtonVisible: pageInfo.loginButtonVisible,
+          editorVisible: pageInfo.editorVisible,
+        },
       };
     },
 
@@ -216,61 +340,221 @@ export function createOps(page) {
       return { ok: true };
     },
 
-    /**
-     * 获取当前选中的模型名称
-     *
-     * 读取 .picker-primary-text 的 innerText（如 "Pro" / "Flash" / "Flash-Lite"），
-     * 返回原始文本和标准化 model（小写、归类）。
-     *
-     * 标准化规则：
-     *   - "Pro"        → model='pro'
-     *   - "Flash"      → model='flash'
-     *   - "Flash-Lite" → model='flash-lite'
-     *
-     * @returns {Promise<{ok: boolean, model: string, raw: string, error?: string}>}
-     */
+    /** 获取当前模型的规范模型族和可见版本标签。 */
     async getCurrentModel() {
-      return op.query((sels) => {
+      let result;
+      try {
+        result = await op.query((sels) => {
         let el = null;
         for (const sel of sels) {
-          try { el = document.querySelector(sel); } catch { /* skip */ }
+          try {
+            el = [...document.querySelectorAll(sel)].find((node) => {
+              const rect = node.getBoundingClientRect?.();
+              if (rect && (rect.width <= 0 || rect.height <= 0)) return false;
+              const style = getComputedStyle(node);
+              return style.display !== 'none' && style.visibility !== 'hidden';
+            }) || null;
+          } catch { /* skip */ }
           if (el) break;
         }
-        if (!el) {
-          return { ok: false, model: '', raw: '', error: 'model_label_not_found' };
-        }
-        const raw = (el.textContent || '').trim();
-        const lower = raw.toLowerCase();
-
-        // 标准化：归类到 pro / flash / flash-lite
-        let model = lower;
-        if (lower.includes('flash-lite')) model = 'flash-lite';
-        else if (lower.includes('flash')) model = 'flash';
-        else if (lower.includes('pro')) model = 'pro';
-
-        return { ok: true, model, raw };
-      }, SELECTORS.modelLabel);
+        return el ? { raw: (el.textContent || '').trim() } : { error: 'model_label_not_found' };
+        }, SELECTORS.modelLabel);
+      } catch (error) {
+        return { ok: false, model: 'unknown', version: null, raw: '', error: 'model_label_query_failed', detail: error.message || String(error) };
+      }
+      if (result.error) return { ok: false, model: 'unknown', version: null, raw: '', error: result.error };
+      return { ok: true, ...parseModelLabel(result.raw) };
     },
 
-    /**
-     * 获取当前思考深度
-     *
-     * .picker-secondary-text 元素存在 → 扩展思考；不存在 → 标准思考。
-     *
-     * @returns {Promise<{ok: boolean, level: 'standard'|'extended', raw: string}>}
-     */
+    /** Read model labels currently rendered in the open model menu. */
+    async getAvailableModels() {
+      const labels = await op.query(() => [...document.querySelectorAll('gem-menu-item')]
+        .filter(item => {
+          const rect = item.getBoundingClientRect?.();
+          if (rect && (rect.width <= 0 || rect.height <= 0)) return false;
+          const style = getComputedStyle(item);
+          return style.display !== 'none' && style.visibility !== 'hidden';
+        })
+        .map(item => item.querySelector('span.label')?.textContent?.trim() || '')
+        .filter(Boolean));
+      return labels.map(parseModelLabel).filter(item => item.version || item.model !== 'unknown');
+    },
+
+    /** Read the currently checked full model label from the open model menu. */
+    async _getSelectedModelMenuLabels() {
+      let menuOpen = await op.query(() => [...document.querySelectorAll('gem-menu-item')].some(item => {
+        const rect = item.getBoundingClientRect?.();
+        if (rect && (rect.width <= 0 || rect.height <= 0)) return false;
+        const style = getComputedStyle(item);
+        return style.display !== 'none' && style.visibility !== 'hidden';
+      }));
+      let openedMenu = false;
+      if (!menuOpen) {
+        const opened = await this._openModelMenu();
+        if (!opened.ok) return { ok: false, labels: [], error: opened.error };
+        openedMenu = true;
+      }
+      try {
+        const labels = await op.query(() => [...document.querySelectorAll('gem-menu-item')]
+          .filter(item => {
+            const rect = item.getBoundingClientRect?.();
+            if (rect && (rect.width <= 0 || rect.height <= 0)) return false;
+            const style = getComputedStyle(item);
+            return style.display !== 'none' && style.visibility !== 'hidden';
+          })
+          .filter(item => item.getAttribute?.('aria-checked') === 'true'
+            || item.getAttribute?.('aria-selected') === 'true'
+            || item.hasAttribute?.('checked') || item.hasAttribute?.('selected')
+            || /\b(selected|checked|active)\b/i.test(String(item.className || ''))
+            || !!item.querySelector?.('mat-icon[fonticon="check"],mat-icon[data-mat-icon-name="check"],[data-test-id*="check"],.checkmark,.check-icon,[aria-label*="selected" i],[aria-label*="checked" i]'))
+          .map(item => item.querySelector('span.label')?.textContent?.trim() || '')
+          .filter(Boolean));
+        return { ok: labels.length === 1, labels, error: labels.length === 1 ? undefined : labels.length ? 'model_selection_ambiguous' : 'model_selection_not_checked' };
+      } finally {
+        if (openedMenu) await this._closeModelMenu();
+      }
+    },
+
+    /** 获取当前思考等级；旧页面 standard/extended 映射为 medium/high。 */
     async getThinkingDepth() {
-      return op.query((sels) => {
-        let el = null;
-        for (const sel of sels) {
-          try { el = document.querySelector(sel); } catch { /* skip */ }
-          if (el) break;
+      let labelResult;
+      let modelResult;
+      try {
+        [labelResult, modelResult] = await Promise.all([
+        op.query((sels) => {
+          let el = null;
+          for (const sel of sels) {
+            try {
+              el = [...document.querySelectorAll(sel)].find((node) => {
+                const rect = node.getBoundingClientRect?.();
+                if (rect && (rect.width <= 0 || rect.height <= 0)) return false;
+                const style = getComputedStyle(node);
+                return style.display !== 'none' && style.visibility !== 'hidden';
+              }) || null;
+            } catch { /* skip */ }
+            if (el) break;
+          }
+          return { raw: (el?.textContent || '').trim() };
+        }, SELECTORS.thinkingDepthLabel),
+        this.getCurrentModel(),
+        ]);
+      } catch (error) {
+        return { ok: false, level: 'unknown', raw: '', error: 'thinking_depth_query_failed', detail: error.message || String(error) };
+      }
+      const raw = labelResult.raw;
+      if (raw) {
+        const level = parseThinkingLabel(raw);
+        if (level) return { ok: true, level, legacyLevel: legacyThinkingLevel(level), raw };
+      }
+      let menuResult;
+      try {
+        menuResult = await this._getThinkingDepthFromMenu();
+      } catch (error) {
+        return { ok: false, level: 'unknown', raw, error: 'thinking_depth_menu_read_failed', detail: error.message || String(error) };
+      }
+      if (menuResult.ok) return { ...menuResult, legacyLevel: legacyThinkingLevel(menuResult.level), raw: menuResult.raw };
+      return { ok: false, level: 'unknown', raw, error: raw ? 'thinking_depth_unrecognized' : menuResult.error || (modelResult.model === 'argon' ? 'thinking_depth_not_exposed' : 'thinking_depth_unsupported') };
+    },
+
+    /** Read the selected thinking option from visible submenu state/checkmarks. */
+    async _getThinkingDepthFromMenu() {
+      let state = await op.query(() => {
+        const visible = (item) => {
+          const rect = item.getBoundingClientRect?.();
+          if (rect && (rect.width <= 0 || rect.height <= 0)) return false;
+          const style = getComputedStyle(item);
+          return style.display !== 'none' && style.visibility !== 'hidden';
+        };
+        return { menuOpen: [...document.querySelectorAll('gem-menu-item')].some(visible) };
+      });
+      let openedMenu = false;
+      let openedSubmenu = false;
+      if (!state.menuOpen) {
+        const opened = await this._openModelMenu();
+        if (!opened.ok) return { ok: false, level: 'unknown', error: opened.error };
+        openedMenu = true;
+      }
+
+      try {
+        state = await op.query(() => {
+          const visible = (item) => {
+            const rect = item.getBoundingClientRect?.();
+            if (rect && (rect.width <= 0 || rect.height <= 0)) return false;
+            const style = getComputedStyle(item);
+            return style.display !== 'none' && style.visibility !== 'hidden';
+          };
+          const items = [...document.querySelectorAll('gem-menu-item')].filter(visible);
+          const levelOf = (label) => {
+            const text = String(label || '').trim().toLowerCase();
+            if (/^(?:low|低点|低)(?:$|[\s（(])/i.test(text)) return 'low';
+            if (/^(?:medium|mid|standard|中等|中|标准)(?:$|[\s（(])/i.test(text)) return 'medium';
+            if (/^(?:high|extended|高点|高|扩展)(?:$|[\s（(])/i.test(text)) return 'high';
+            return null;
+          };
+          const options = items.map(item => ({ item, label: item.querySelector('span.label')?.textContent?.trim() || '' }))
+            .filter(option => option.label && levelOf(option.label));
+          if (options.length) {
+            const isChecked = (item) => {
+              if (item.getAttribute?.('aria-checked') === 'true' || item.getAttribute?.('aria-selected') === 'true') return true;
+              if (item.hasAttribute?.('checked') || item.hasAttribute?.('selected')) return true;
+              if (/\b(selected|checked|active)\b/i.test(String(item.className || ''))) return true;
+              return !!item.querySelector?.('mat-icon[fonticon="check"],mat-icon[data-mat-icon-name="check"],[data-test-id*="check"],.checkmark,.check-icon,[aria-label*="selected" i],[aria-label*="checked" i]');
+            };
+            const selected = options.filter(option => isChecked(option.item));
+            if (selected.length !== 1) {
+              return { done: true, result: { ok: false, level: 'unknown', error: selected.length ? 'thinking_selection_ambiguous' : 'thinking_selection_not_checked' } };
+            }
+            return { done: true, result: { ok: true, level: levelOf(selected[0].label), raw: selected[0].label } };
+          }
+          const entry = items.find(item => {
+            const trailing = item.querySelector('.trailing-container');
+            const label = item.querySelector('span.label')?.textContent?.trim() || '';
+            return trailing?.children?.length > 0 && /thinking|思考|level|等级|reasoning|推理/i.test(label);
+          });
+          if (entry) {
+            entry.click();
+            return { done: false, submenuOpened: true };
+          }
+          return { done: true, result: { ok: false, level: 'unknown', error: 'thinking_depth_unsupported' } };
+        });
+        if (state.submenuOpened) {
+          openedSubmenu = true;
+          await sleep(300);
+          state = await op.query(() => {
+            const visible = (item) => {
+              const rect = item.getBoundingClientRect?.();
+              if (rect && (rect.width <= 0 || rect.height <= 0)) return false;
+              const style = getComputedStyle(item);
+              return style.display !== 'none' && style.visibility !== 'hidden';
+            };
+            const levelOf = (label) => {
+              const text = String(label || '').trim().toLowerCase();
+              if (/^(?:low|低点|低)(?:$|[\s（(])/i.test(text)) return 'low';
+              if (/^(?:medium|mid|standard|中等|中|标准)(?:$|[\s（(])/i.test(text)) return 'medium';
+              if (/^(?:high|extended|高点|高|扩展)(?:$|[\s（(])/i.test(text)) return 'high';
+              return null;
+            };
+            const options = [...document.querySelectorAll('gem-menu-item')].filter(visible)
+              .map(item => ({ item, label: item.querySelector('span.label')?.textContent?.trim() || '' }))
+              .filter(option => option.label && levelOf(option.label));
+            const isChecked = (item) => item.getAttribute?.('aria-checked') === 'true'
+              || item.getAttribute?.('aria-selected') === 'true'
+              || item.hasAttribute?.('checked') || item.hasAttribute?.('selected')
+              || /\b(selected|checked|active)\b/i.test(String(item.className || ''))
+              || !!item.querySelector?.('mat-icon[fonticon="check"],mat-icon[data-mat-icon-name="check"],[data-test-id*="check"],.checkmark,.check-icon,[aria-label*="selected" i],[aria-label*="checked" i]');
+            const selected = options.filter(option => isChecked(option.item));
+            if (selected.length !== 1) {
+              return { ok: false, level: 'unknown', error: selected.length ? 'thinking_selection_ambiguous' : options.length ? 'thinking_selection_not_checked' : 'thinking_submenu_not_found' };
+            }
+            return { ok: true, level: levelOf(selected[0].label), raw: selected[0].label };
+          });
+        } else {
+          state = state.result;
         }
-        if (el) {
-          return { ok: true, level: 'extended', raw: (el.textContent || '').trim() };
-        }
-        return { ok: true, level: 'standard', raw: '' };
-      }, SELECTORS.thinkingDepthLabel);
+      } finally {
+        if (openedMenu || openedSubmenu) await this._closeModelMenu();
+      }
+      return state;
     },
 
     /**
@@ -308,121 +592,154 @@ export function createOps(page) {
       await sleep(150);
     },
 
-    /**
-     * 切换到指定模型（基于 menu-item 内的 .label 文本匹配）
-     *
-     * 流程：
-     *   1. 打开模型菜单
-     *   2. 遍历菜单项，根据 label 文本匹配关键词（pro / flash-lite / flash）
-     *   3. 点击命中的项
-     *
-     * @param {'pro'|'flash'|'flash-lite'} model - 目标模型
-     * @returns {Promise<{ok: boolean, error?: string, previousModel?: string}>}
-     */
+    /** Switch by model family, or dynamically resolve the highest available version for `latest`. */
     async switchToModel(model) {
-      const keywordMap = {
-        'pro': 'pro',
-        'flash-lite': 'flash-lite',
-        'flash': 'flash',
-      };
-      const keyword = keywordMap[model];
-      if (!keyword) {
-        return { ok: false, error: `unknown_model: ${model}（可选: pro / flash / flash-lite）` };
-      }
-
-      // 记录切换前的模型
+      try {
+      const targetFamily = normalizeModelTarget(model);
+      if (!targetFamily) return { ok: false, error: `unknown_model: ${model}` };
       const before = await this.getCurrentModel();
       const previousModel = before.ok ? before.raw : undefined;
-
-      // 已经是目标模型，跳过
-      if (before.ok && before.model === model) {
-        console.log(`[ops] model is already ${model}, skip`);
-        return { ok: true, previousModel, alreadyTarget: true };
+      if (targetFamily !== 'latest' && before.ok && before.model === targetFamily) {
+        return { ok: true, switched: false, model: before.model, raw: before.raw, version: before.version, previousModel, alreadyTarget: true };
       }
-
-      // 1. 打开模型菜单
       const openResult = await this._openModelMenu();
-      if (!openResult.ok) {
-        return { ok: false, error: openResult.error, previousModel };
-      }
+      if (!openResult.ok) return { ok: false, error: openResult.error, previousModel };
 
-      // 2. 在菜单中通过 label 文本匹配并点击
-      const clickResult = await op.query((kw) => {
-        const items = [...document.querySelectorAll('gem-menu-item')];
-        for (const item of items) {
-          const labelEl = item.querySelector('span.label');
-          if (!labelEl) continue;
-          const label = (labelEl.textContent || '').trim().toLowerCase();
-
-          // flash-lite 必须严格匹配（带 -lite），避免被普通 flash 误匹配
-          if (kw === 'flash-lite' && !label.includes('flash-lite')) continue;
-          if (kw === 'flash' && (!label.includes('flash') || label.includes('flash-lite'))) continue;
-          if (kw === 'pro' && !label.includes('pro')) continue;
-
-          // 命中：点击这个 menu-item
-          item.click();
-          return { ok: true, label, tagName: item.tagName.toLowerCase() };
-        }
-        return { ok: false, error: 'no_matching_menu_item' };
-      }, keyword);
-
-      if (!clickResult.ok) {
-        // 找不到目标项，关菜单避免阻塞后续
+      const menuEntries = await op.query(() => [...document.querySelectorAll('gem-menu-item')]
+        .filter(item => {
+          const rect = item.getBoundingClientRect?.();
+          if (rect && (rect.width <= 0 || rect.height <= 0)) return false;
+          const style = getComputedStyle(item);
+          return style.display !== 'none' && style.visibility !== 'hidden';
+        })
+        .map(item => ({
+          label: item.querySelector('span.label')?.textContent?.trim() || '',
+          selected: item.getAttribute?.('aria-checked') === 'true'
+            || item.getAttribute?.('aria-selected') === 'true'
+            || item.hasAttribute?.('checked') || item.hasAttribute?.('selected')
+            || /\b(selected|checked|active)\b/i.test(String(item.className || ''))
+            || !!item.querySelector?.('mat-icon[fonticon="check"],mat-icon[data-mat-icon-name="check"],[data-test-id*="check"],.checkmark,.check-icon,[aria-label*="selected" i],[aria-label*="checked" i]'),
+        }))
+        .filter(item => item.label));
+      const labels = menuEntries.map(entry => entry.label);
+      const available = labels.map(label => ({ ...parseModelLabel(label), label }));
+      let candidates = available;
+      if (targetFamily !== 'latest') candidates = candidates.filter(item => item.model === targetFamily);
+      else candidates = candidates.filter(item => item.version);
+      if (!candidates.length) {
         await this._closeModelMenu();
-        return { ok: false, error: `model_option_${model}_not_found`, previousModel };
+        return { ok: false, error: targetFamily === 'latest' ? 'latest_model_not_found' : `model_option_${targetFamily}_not_found`, previousModel };
+      }
+      candidates.sort((a, b) => compareModelVersions(b.version, a.version));
+      const selected = candidates[0];
+      if (targetFamily === 'latest' && candidates.length > 1
+        && compareModelVersions(candidates[0].version, candidates[1].version) === 0
+        && candidates[0].label !== candidates[1].label) {
+        await this._closeModelMenu();
+        return { ok: false, error: 'latest_model_version_ambiguous', previousModel };
+      }
+      const alreadyTarget = before.ok && before.model === selected.model
+        && (targetFamily !== 'latest' || before.version === selected.version);
+      const checkedTarget = targetFamily === 'latest' && before.ok && before.model === selected.model
+        && !before.version && menuEntries.filter(entry => entry.selected).length === 1
+        && menuEntries.find(entry => entry.selected)?.label === selected.label;
+      if (alreadyTarget || checkedTarget) {
+        await this._closeModelMenu();
+        return { ok: true, switched: false, model: before.model, raw: before.raw, version: selected.version, previousModel, selected: selected.label, alreadyTarget: true };
       }
 
-      // 3. 等待 UI 稳定
-      await sleep(800);
+      const clickResult = await op.query((targetLabel) => {
+        for (const item of document.querySelectorAll('gem-menu-item')) {
+          const rect = item.getBoundingClientRect?.();
+          if (rect && (rect.width <= 0 || rect.height <= 0)) continue;
+          const style = getComputedStyle(item);
+          if (style.display === 'none' || style.visibility === 'hidden') continue;
+          const label = item.querySelector('span.label')?.textContent?.trim() || '';
+          if (label !== targetLabel) continue;
+          item.click();
+          return { ok: true, label };
+        }
+        return { ok: false, error: 'model_option_disappeared' };
+      }, selected.label);
+      if (!clickResult.ok) {
+        await this._closeModelMenu();
+        return { ok: false, error: clickResult.error, previousModel };
+      }
 
-      console.log(`[ops] switched model: ${previousModel || '?'} → ${model} (label="${clickResult.label}")`);
-      return { ok: true, previousModel };
+      await sleep(800);
+      const after = await this.getCurrentModel();
+      const familyConfirmed = after.ok && after.model === selected.model;
+      let observedVersion = after.version;
+      let menuConfirmed = false;
+      if (targetFamily === 'latest' && familyConfirmed && !after.version) {
+        const selectedMenu = await this._getSelectedModelMenuLabels();
+        const selectedLabels = selectedMenu.ok ? selectedMenu.labels.map(parseModelLabel) : [];
+        const checked = selectedMenu.ok && selectedMenu.labels.length === 1
+          && selectedMenu.labels[0] === selected.label
+          && selectedLabels[0]?.model === selected.model
+          && selectedLabels[0]?.version === selected.version;
+        menuConfirmed = !!checked;
+        if (checked) observedVersion = selectedLabels[0].version;
+      }
+      const versionConfirmed = targetFamily !== 'latest'
+        || (after.ok && (after.version === selected.version || menuConfirmed));
+      if (!familyConfirmed || !versionConfirmed) {
+        return { ok: false, error: 'model_switch_not_confirmed', model: after.model, raw: after.raw, version: observedVersion, previousModel, selected: selected.label };
+      }
+      return {
+        ok: true,
+        switched: true,
+        model: after.model,
+        raw: after.raw,
+        version: observedVersion,
+        previousModel,
+        selected: selected.label,
+      };
+      } catch (error) {
+        return { ok: false, error: 'model_selection_failed', detail: error.message || String(error) };
+      }
+    },
+
+    /** Ensure the current model is the latest menu version; explicit opt-in, not the default. */
+    async ensureLatestModel() {
+      const result = await this.switchToModel('latest');
+      return { ok: result.ok, switched: result.switched ?? false, model: result.model, raw: result.raw, error: result.error };
     },
 
     /**
-     * 切换思考深度
-     *
-     * 流程：
-     *   1. 打开模型菜单
-     *   2. 找到 trailing-container 有子元素的 menu-item（即"思考深度"入口），点击进入子菜单
-     *   3. 在二级菜单中：靠前的是「标准」，靠后的是「扩展」
-     *   4. 点击对应项
-     *
-     * @param {'standard'|'extended'} level - 目标思考深度
-     * @returns {Promise<{ok: boolean, error?: string, previousLevel?: string}>}
+     * 切换思考等级。主标签匹配 low/medium/high 与旧版 standard/extended。
      */
     async setThinkingDepth(level) {
-      if (level !== 'standard' && level !== 'extended') {
-        return { ok: false, error: `unknown_level: ${level}（可选: standard / extended）` };
+      try {
+      const targetLevel = normalizeThinkingLevel(level);
+      if (!targetLevel) return { ok: false, error: `unknown_level: ${level}` };
+      const currentModel = await this.getCurrentModel();
+      if (!currentModel.ok || !['argon', 'pro'].includes(currentModel.model)) {
+        return { ok: false, error: currentModel.ok ? 'thinking_depth_unsupported' : 'current_model_unavailable' };
       }
-
-      // 记录切换前的等级
       const before = await this.getThinkingDepth();
       const previousLevel = before.ok ? before.level : undefined;
-
-      if (previousLevel === level) {
-        console.log(`[ops] thinking depth is already ${level}, skip`);
-        return { ok: true, previousLevel, alreadyTarget: true };
+      if (before.ok && before.level === targetLevel) {
+        return { ok: true, level: targetLevel, legacyLevel: legacyThinkingLevel(targetLevel), switched: false, alreadyTarget: true, previousLevel };
       }
-
-      // 1. 打开模型菜单
       const openResult = await this._openModelMenu();
-      if (!openResult.ok) {
-        return { ok: false, error: openResult.error, previousLevel };
-      }
+      if (!openResult.ok) return { ok: false, error: openResult.error, previousLevel };
 
-      // 2. 找到思考深度入口（trailing-container 有子元素的 menu-item），记录展开前的项数
       const enterResult = await op.query(() => {
         const items = [...document.querySelectorAll('gem-menu-item')];
-        const beforeCount = items.length;
         for (const item of items) {
+          const rect = item.getBoundingClientRect?.();
+          if (rect && (rect.width <= 0 || rect.height <= 0)) continue;
+          const style = getComputedStyle(item);
+          if (style.display === 'none' || style.visibility === 'hidden') continue;
           const trailing = item.querySelector('.trailing-container');
-          if (trailing && trailing.children.length > 0) {
+          const label = item.querySelector('span.label')?.textContent?.trim() || '';
+          if (trailing && trailing.children.length > 0 && /thinking|思考|level|等级|reasoning|推理/i.test(label)) {
             item.click();
-            return { ok: true, beforeCount };
+            return { ok: true };
           }
         }
-        return { ok: false, error: 'thinking_depth_entry_not_found', beforeCount };
+        return { ok: false, error: 'thinking_depth_unsupported' };
       });
 
       if (!enterResult.ok) {
@@ -430,34 +747,59 @@ export function createOps(page) {
         return { ok: false, error: enterResult.error, previousLevel };
       }
 
-      // 3. 等子菜单展开
       await sleep(400);
 
-      // 4. 子菜单展开后会多出 2 个 menu-item（标准 + 扩展），位置靠前是标准，靠后是扩展
-      //    选最后两个中的对应项点击
-      const pickResult = await op.query((targetLevel, beforeCount) => {
-        const items = [...document.querySelectorAll('gem-menu-item')];
-        if (items.length <= beforeCount) {
-          return { ok: false, error: 'submenu_not_expanded', currentCount: items.length, beforeCount };
-        }
-        // 子菜单的两个新选项是数组的最后两个：倒数第二 = 标准，最后 = 扩展
-        const standard = items[items.length - 2];
-        const extended = items[items.length - 1];
-        const target = targetLevel === 'extended' ? extended : standard;
-        if (!target) return { ok: false, error: 'target_item_not_found' };
-        target.click();
-        const labelEl = target.querySelector('span.label');
-        return { ok: true, label: labelEl ? labelEl.textContent.trim() : '' };
-      }, level, enterResult.beforeCount);
+      const targetLabel = await op.query((wantedLevel) => {
+        const matches = (label) => {
+          const text = String(label || '').trim().toLowerCase();
+          if (/^(?:low|低点|低)(?:$|[\s（(])/i.test(text)) return 'low';
+          if (/^(?:medium|mid|standard|中等|中|标准)(?:$|[\s（(])/i.test(text)) return 'medium';
+          if (/^(?:high|extended|高点|高|扩展)(?:$|[\s（(])/i.test(text)) return 'high';
+          return null;
+        };
+        const options = [...document.querySelectorAll('gem-menu-item')].filter(item => {
+          const rect = item.getBoundingClientRect?.();
+          if (rect && (rect.width <= 0 || rect.height <= 0)) return false;
+          const style = getComputedStyle(item);
+          return style.display !== 'none' && style.visibility !== 'hidden';
+        }).map(item => ({
+          item,
+          label: item.querySelector('span.label')?.textContent?.trim() || '',
+        })).filter(option => option.label && matches(option.label) === wantedLevel);
+        return options.at(-1)?.label || '';
+      }, targetLevel);
 
+      if (!targetLabel) {
+        await this._closeModelMenu();
+        return { ok: false, error: 'thinking_level_not_supported', previousLevel };
+      }
+      const pickResult = await op.query((wantedLabel) => {
+        for (const item of document.querySelectorAll('gem-menu-item')) {
+          const rect = item.getBoundingClientRect?.();
+          if (rect && (rect.width <= 0 || rect.height <= 0)) continue;
+          const style = getComputedStyle(item);
+          if (style.display === 'none' || style.visibility === 'hidden') continue;
+          const label = item.querySelector('span.label')?.textContent?.trim() || '';
+          if (label !== wantedLabel) continue;
+          item.click();
+          return { ok: true, label };
+        }
+        return { ok: false, error: 'thinking_level_disappeared' };
+      }, targetLabel);
       if (!pickResult.ok) {
         await this._closeModelMenu();
         return { ok: false, error: pickResult.error, previousLevel };
       }
 
-      await sleep(800);
-      console.log(`[ops] switched thinking depth: ${previousLevel || '?'} → ${level} (label="${pickResult.label}")`);
-      return { ok: true, previousLevel };
+      await sleep(600);
+      const after = await this.getThinkingDepth();
+      if (!after.ok || after.level !== targetLevel) {
+        return { ok: false, error: 'thinking_depth_switch_not_confirmed', previousLevel, requestedLevel: targetLevel, observedLevel: after.level };
+      }
+      return { ok: true, level: targetLevel, legacyLevel: legacyThinkingLevel(targetLevel), switched: true, previousLevel };
+      } catch (error) {
+        return { ok: false, error: 'thinking_depth_selection_failed', detail: error.message || String(error) };
+      }
     },
 
     /**
@@ -595,7 +937,7 @@ export function createOps(page) {
      * @returns {Promise<{answering: boolean, status: 'idle'|'answering', detail: object}>}
      */
     async getAnswerState() {
-      const detail = await this.getActionBtnStatus();
+      const detail = await this.getStatus();
       const answering = detail.status === 'stop';
       return {
         answering,
@@ -624,6 +966,186 @@ export function createOps(page) {
      */
     async checkImageLoaded() {
       return isImageLoaded(op);
+    },
+
+    /**
+     * Capture the current model-response turns and their image descendants.
+     * Only `div.response-content` nodes are treated as model replies; user
+     * prompts, composer attachments, and reference images are not baselined as
+     * assistant output.
+     */
+    async getResponseSnapshot() {
+      return op.query(() => {
+        const responseSelector = 'div.response-content';
+        const responses = [...document.querySelectorAll(responseSelector)];
+        const loadedImages = [...document.querySelectorAll('img.image.loaded')];
+
+        const stableAttributes = (el) => {
+          if (!el?.attributes) return '';
+          const attrs = [...el.attributes]
+            .filter(attr => attr.name === 'id'
+              || attr.name === 'data-test-id'
+              || attr.name === 'data-message-id'
+              || attr.name === 'data-turn-id'
+              || attr.name === 'data-conversation-id'
+              || attr.name === 'data-thread-id'
+              || attr.name === 'data-session-id'
+              || attr.name === 'data-id'
+              || attr.name === 'aria-label')
+            .map(attr => `${attr.name}=${attr.value}`)
+            .sort();
+          return attrs.join(',');
+        };
+
+        const responseRoot = (el) => {
+          let root = el;
+          let parent = el.parentElement;
+          for (let depth = 0; parent && parent !== document.body && depth < 3; depth++) {
+            if (parent.querySelectorAll(responseSelector).length > 1) break;
+            root = parent;
+            const semantic = `${parent.getAttribute?.('data-test-id') || ''} ${parent.id || ''} ${typeof parent.className === 'string' ? parent.className : ''}`;
+            if (/response|turn|message|model/i.test(semantic)) break;
+            parent = parent.parentElement;
+          }
+          return root;
+        };
+
+        const imageInfo = (img) => {
+          const src = img.currentSrc || img.src || '';
+          return {
+            src,
+            alt: img.alt || '',
+            width: img.naturalWidth || 0,
+            height: img.naturalHeight || 0,
+            loaded: !!img.complete && (img.naturalWidth || 0) > 0,
+            index: loadedImages.indexOf(img) >= 0 ? loadedImages.indexOf(img) : null,
+            isNew: !img.classList?.contains('animate'),
+          };
+        };
+
+        const turns = responses.map((el, index) => {
+          const root = responseRoot(el);
+          const identityParts = [];
+          let node = el;
+          for (let depth = 0; node && node !== document.body && depth < 7; depth++, node = node.parentElement) {
+            const attrs = stableAttributes(node);
+            if (attrs) identityParts.push(`${node.tagName.toLowerCase()}[${attrs}]`);
+          }
+          const identity = `${identityParts.join('/') || 'response'}#${index}`;
+          const images = [...root.querySelectorAll('img')].map(imageInfo);
+          const loader = !!root.querySelector('div.loader.animate');
+          return {
+            index,
+            identity,
+            text: (el.innerText || '').trim(),
+            images,
+            loader,
+          };
+        });
+
+        const chatRoot = document.querySelector('[data-conversation-id]')
+          || document.querySelector('[data-thread-id]')
+          || document.querySelector('[data-test-id*="conversation"]')
+          || document.querySelector('[data-test-id="chat-history"]')
+          || document.querySelector('main')
+          || document.body;
+        const chatIdentity = stableAttributes(chatRoot) || chatRoot?.tagName?.toLowerCase() || 'document';
+        const pageKey = `${location.href}|${chatIdentity}`;
+        const userNodes = [
+          ...document.querySelectorAll('user-query'),
+          ...document.querySelectorAll('[data-test-id="user-query"]'),
+          ...document.querySelectorAll('[data-test-id*="user-query"]'),
+        ];
+        const userTurnTexts = [...new Set(userNodes)]
+          .map(node => (node.innerText || node.textContent || '').trim())
+          .filter(Boolean);
+        return {
+          ok: true,
+          pageKey,
+          pathname: location.pathname,
+          userTurnTexts,
+          responses: turns,
+          imageSources: [...new Set(turns.flatMap(turn => turn.images.map(img => img.src)).filter(Boolean))],
+          total: turns.length,
+        };
+      });
+    },
+
+    /** Return image state scoped to a single response, not the page tail. */
+    async getResponseImages({ index, identity, pageKey } = {}) {
+      return op.query((targetIndex, expectedIdentity, expectedPageKey) => {
+        const responseSelector = 'div.response-content';
+        const responses = [...document.querySelectorAll(responseSelector)];
+        const stableAttributes = (node) => {
+          if (!node?.attributes) return '';
+          return [...node.attributes]
+            .filter(attr => attr.name === 'id'
+              || attr.name === 'data-test-id'
+              || attr.name === 'data-message-id'
+              || attr.name === 'data-turn-id'
+              || attr.name === 'data-conversation-id'
+              || attr.name === 'data-thread-id'
+              || attr.name === 'data-session-id'
+              || attr.name === 'data-id'
+              || attr.name === 'aria-label')
+            .map(attr => `${attr.name}=${attr.value}`)
+            .sort()
+            .join(',');
+        };
+        const chatRoot = document.querySelector('[data-conversation-id]')
+          || document.querySelector('[data-thread-id]')
+          || document.querySelector('[data-test-id*="conversation"]')
+          || document.querySelector('[data-test-id="chat-history"]')
+          || document.querySelector('main')
+          || document.body;
+        const chatIdentity = stableAttributes(chatRoot) || chatRoot?.tagName?.toLowerCase() || 'document';
+        const currentPageKey = `${location.href}|${chatIdentity}`;
+        if (expectedPageKey && currentPageKey !== expectedPageKey) return { ok: false, error: 'page_changed' };
+        if (targetIndex == null || targetIndex < 0 || targetIndex >= responses.length) {
+          return { ok: false, error: 'page_changed' };
+        }
+
+        const el = responses[targetIndex];
+        const parts = [];
+        let node = el;
+        for (let depth = 0; node && node !== document.body && depth < 7; depth++, node = node.parentElement) {
+          const attrs = stableAttributes(node);
+          if (attrs) parts.push(`${node.tagName.toLowerCase()}[${attrs}]`);
+        }
+        const currentIdentity = `${parts.join('/') || 'response'}#${targetIndex}`;
+        if (expectedIdentity && currentIdentity !== expectedIdentity) return { ok: false, error: 'page_changed' };
+
+        let root = el;
+        let parent = el.parentElement;
+        for (let depth = 0; parent && parent !== document.body && depth < 3; depth++) {
+          if (parent.querySelectorAll(responseSelector).length > 1) break;
+          root = parent;
+          const semantic = `${parent.getAttribute?.('data-test-id') || ''} ${parent.id || ''} ${typeof parent.className === 'string' ? parent.className : ''}`;
+          if (/response|turn|message|model/i.test(semantic)) break;
+          parent = parent.parentElement;
+        }
+
+        const loadedImages = [...document.querySelectorAll('img.image.loaded')];
+        const images = [...root.querySelectorAll('img')].map(img => {
+          const src = img.currentSrc || img.src || '';
+          const globalIndex = loadedImages.indexOf(img);
+          return {
+            src,
+            alt: img.alt || '',
+            width: img.naturalWidth || 0,
+            height: img.naturalHeight || 0,
+            loaded: !!img.complete && (img.naturalWidth || 0) > 0,
+            index: globalIndex >= 0 ? globalIndex : null,
+          };
+        });
+        return {
+          ok: true,
+          pageKey: currentPageKey,
+          identity: currentIdentity,
+          images,
+          loader: !!root.querySelector('div.loader.animate'),
+        };
+      }, index, identity, pageKey);
     },
 
     /**
@@ -977,7 +1499,7 @@ export function createOps(page) {
      *
      * 流程：
      *   1. 定位目标图片，获取坐标用于 hover
-     *   2. 通过 CDP Browser.setDownloadBehavior 将下载目录重定向到 config.outputDir
+     *   2. 为本次下载创建隔离目录，并通过公开 Browser CDP session 设置下载目录
      *   3. hover 触发工具栏 → 点击"下载完整尺寸"按钮
      *   4. 监听 CDP Browser.downloadWillBegin / Browser.downloadProgress 等待下载完成
      *   5. 返回实际保存的文件路径
@@ -986,191 +1508,355 @@ export function createOps(page) {
      *
      * @param {object} [options]
      * @param {number} [options.index] - 图片索引（从0开始，从旧到新），不传则取最新一张
+     * @param {string} [options.imageUrl] - 精确图片 URL；与 index 同传时必须指向同一张图
      * @param {number} [options.timeout=30000] - 下载超时时间（ms）
      * @returns {Promise<{ok: boolean, filePath?: string, suggestedFilename?: string, src?: string, index?: number, total?: number, error?: string}>}
      */
-    async downloadFullSizeImage({ index, timeout = 30_000 } = {}) {
-      // 1a. 先将目标图片滚动到屏幕正中间，避免视口外的元素无法交互
-      const scrollResult = await op.query((targetIndex) => {
-        const imgs = [...document.querySelectorAll('img.image.loaded')];
-        if (!imgs.length) return { ok: false, error: 'no_loaded_images', total: 0 };
-
-        const i = targetIndex == null ? imgs.length - 1 : targetIndex;
-        if (i < 0 || i >= imgs.length) {
-          return { ok: false, error: 'index_out_of_range', total: imgs.length, requestedIndex: i };
-        }
-
-        const img = imgs[i];
-        // 【关键修复】：强行把图片滚到屏幕正中间，避免视口外的元素无法交互
-        img.scrollIntoView({ behavior: 'instant', block: 'center' });
-        return { ok: true, index: i, total: imgs.length };
-      }, index);
-
-      if (!scrollResult.ok) return scrollResult;
-
-      // 1b. 等待滚动和重排完成后，再获取准确的坐标
-      await sleep(500);
-
-      const imgInfo = await op.query((targetIndex) => {
-        const imgs = [...document.querySelectorAll('img.image.loaded')];
-        const i = targetIndex == null ? imgs.length - 1 : targetIndex;
-        const img = imgs[i];
-        const rect = img.getBoundingClientRect();
-        return {
-          ok: true,
-          x: rect.left + rect.width / 2,
-          y: rect.top + rect.height / 2,
-          src: img.src || '',
-          index: i,
-          total: imgs.length,
-        };
-      }, scrollResult.index);
-
-      console.log('[downloadFullSizeImage] imgInfo', imgInfo);
-
-      if (!imgInfo.ok) return imgInfo;
-
-      // 2. 通过 CDP 设置下载路径到 config.outputDir
-      //    用 resolve() 规范化路径，确保 Windows Server 上是标准反斜杠路径
-      const { resolve: pathResolve } = await import('node:path');
-      const downloadDir = pathResolve(config.outputDir);
-      mkdirSync(downloadDir, { recursive: true });
-
-      const client = page._client();
-      await client.send('Browser.setDownloadBehavior', {
-        behavior: 'allow',       // 不用 allowAndName，避免 GUID 临时文件被 Windows Server 安全策略拦截
-        downloadPath: downloadDir,
-        eventsEnabled: true,
+    async downloadFullSizeImage({ index, imageUrl, timeout = 30_000 } = {}) {
+      const baseResult = (imgInfo, fields = {}) => ({
+        ok: false,
+        ...fields,
+        ...(imgInfo ? { src: imgInfo.src, index: imgInfo.index, total: imgInfo.total } : {}),
       });
-
-      // 3. 设置下载监听（在点击前注册，避免遗漏事件）
-      const downloadPromise = new Promise((resolve, reject) => {
-        const timer = setTimeout(() => {
-          client.off('Browser.downloadWillBegin', onBegin);
-          client.off('Browser.downloadProgress', onProgress);
-          reject(new Error('download_timeout'));
-        }, timeout);
-
-        let suggestedFilename = null;
-
-        function onBegin(evt) {
-          suggestedFilename = evt.suggestedFilename || null;
-        }
-
-        function onProgress(evt) {
-          if (evt.state === 'completed') {
-            clearTimeout(timer);
-            client.off('Browser.downloadWillBegin', onBegin);
-            client.off('Browser.downloadProgress', onProgress);
-            resolve({ suggestedFilename });
-          } else if (evt.state === 'canceled') {
-            clearTimeout(timer);
-            client.off('Browser.downloadWillBegin', onBegin);
-            client.off('Browser.downloadProgress', onProgress);
-            reject(new Error('download_canceled'));
+      const urlWasProvided = imageUrl !== undefined && imageUrl !== null;
+      if (index !== undefined && index !== null && (!Number.isInteger(index) || index < 0)) {
+        return baseResult(null, { error: 'invalid_index' });
+      }
+      if (urlWasProvided) {
+        if (typeof imageUrl !== 'string' || !imageUrl.trim()) return baseResult(null, { error: 'invalid_image_url' });
+        try {
+          const parsed = new URL(imageUrl);
+          if (!['http:', 'https:', 'blob:', 'data:'].includes(parsed.protocol)) {
+            return baseResult(null, { error: 'invalid_image_url' });
           }
+        } catch {
+          return baseResult(null, { error: 'invalid_image_url' });
         }
-
-        client.on('Browser.downloadWillBegin', onBegin);
-        client.on('Browser.downloadProgress', onProgress);
-      });
-
-      // 4. hover 到图片上，触发工具栏显示
-      console.log(`[downloadFullSizeImage] hover 到 (${imgInfo.x}, ${imgInfo.y})...`);
-      await page.mouse.move(imgInfo.x, imgInfo.y);
-      await sleep(800);
-
-      // 5. 点击"下载完整尺寸"按钮（带重试：hover 可能需要更长时间触发工具栏）
-      let clickResult;
-      for (let attempt = 1; attempt <= 3; attempt++) {
-        // 先看下按钮是否已经出现，输出诊断信息
-        const btnInfo = await op.locate(SELECTORS.downloadFullSizeBtn);
-        console.log(`[downloadFullSizeImage] 第${attempt}次尝试 — locate 结果:`, btnInfo);
-
-        if (btnInfo.found) {
-          // 用坐标点击
-          clickResult = await op.click(SELECTORS.downloadFullSizeBtn);
-          console.log(`[downloadFullSizeImage] 坐标点击结果:`, clickResult);
-
-          // 双保险：再用 DOM API 直接点击实际的 button 元素（绕过坐标和遮挡问题）
-          const domClickResult = await op.query((sels) => {
-            for (const sel of sels) {
-              try {
-                const candidates = [...document.querySelectorAll(sel)];
-                for (const el of candidates) {
-                  // 找到最近的真实 button（自定义元素本身不可点击）
-                  const btn = el.tagName === 'BUTTON' ? el : el.querySelector('button') || el.closest('button');
-                  if (btn) {
-                    btn.click();
-                    return { ok: true, selector: sel, tagName: btn.tagName.toLowerCase() };
-                  }
-                }
-              } catch { /* skip */ }
-            }
-            return { ok: false, error: 'no_clickable_button_found' };
-          }, SELECTORS.downloadFullSizeBtn);
-          console.log(`[downloadFullSizeImage] DOM 点击结果:`, domClickResult);
-
-          if (clickResult.ok || domClickResult.ok) {
-            clickResult = { ok: true, selector: btnInfo.selector };
-            break;
-          }
-        }
-
-        // 按钮还没出来，可能工具栏动画还没完成，再 hover 一次并多等一会儿
-        console.log(`[downloadFullSizeImage] 第${attempt}次未点击成功，重试 hover...`);
-        await page.mouse.move(imgInfo.x, imgInfo.y);
-        await sleep(500);
+      }
+      const requestedTimeout = Number(timeout);
+      if (!Number.isFinite(requestedTimeout) || requestedTimeout < 0) {
+        return baseResult(null, { error: 'invalid_timeout' });
       }
 
-      if (!clickResult || !clickResult.ok) {
-        return { ok: false, error: 'full_size_download_btn_not_found', src: imgInfo.src, index: imgInfo.index, total: imgInfo.total };
-      }
-
-      console.log('[downloadFullSizeImage] 下载按钮已点击，等待 CDP 下载事件...');
-
-      // 6. 等待下载完成
-      //    allow 模式下，Chrome 直接用 suggestedFilename 保存到 downloadDir，无需重命名。
+      let selected;
       try {
-        const { suggestedFilename } = await downloadPromise;
-        const { join } = await import('node:path');
-        const { existsSync } = await import('node:fs');
+        selected = await op.query((targetIndex, requestedUrl) => {
+          const imgs = [...document.querySelectorAll('img.image.loaded')];
+          if (!imgs.length) return { ok: false, error: 'no_loaded_images', total: 0 };
 
-        const targetName = suggestedFilename || `gemini_fullsize_${Date.now()}.png`;
-        const filePath = join(downloadDir, targetName);
+          const sourceOf = img => img.currentSrc || img.src || '';
+          const normalized = value => {
+            try { return new URL(value, location.href).href; } catch { return String(value || ''); }
+          };
+          let i;
+          if (requestedUrl != null) {
+            const requested = normalized(requestedUrl);
+            const matches = imgs.map((img, position) => normalized(sourceOf(img)) === requested ? position : -1)
+              .filter(position => position >= 0);
+            if (!matches.length) return { ok: false, error: 'image_not_found', total: imgs.length };
+            if (targetIndex != null) {
+              if (targetIndex >= imgs.length) {
+                return { ok: false, error: 'index_out_of_range', total: imgs.length, requestedIndex: targetIndex };
+              }
+              if (normalized(sourceOf(imgs[targetIndex])) !== requested) {
+                return { ok: false, error: 'image_index_mismatch', total: imgs.length, requestedIndex: targetIndex };
+              }
+              i = targetIndex;
+            } else {
+              i = matches[matches.length - 1];
+            }
+          } else {
+            i = targetIndex == null ? imgs.length - 1 : targetIndex;
+            if (i < 0 || i >= imgs.length) {
+              return { ok: false, error: 'index_out_of_range', total: imgs.length, requestedIndex: i };
+            }
+          }
 
-        if (!existsSync(filePath)) {
-          console.warn(`[ops] 下载文件未找到: ${filePath}`);
-          return { ok: false, error: 'downloaded_file_not_found', filePath, src: imgInfo.src, index: imgInfo.index, total: imgInfo.total };
-        }
-
-        // 去水印处理
-        const wmResult = await removeWatermarkFromFile(filePath);
-        if (wmResult.ok && !wmResult.skipped) {
-          console.log(`[ops] 水印已移除 (${wmResult.width}×${wmResult.height}, logo=${wmResult.logoSize}px)`);
-        } else if (wmResult.skipped) {
-          console.log(`[ops] 跳过去水印: ${wmResult.reason}`);
-        } else {
-          console.warn(`[ops] 去水印失败（不影响下载结果）: ${wmResult.error}`);
-        }
-
-        return {
-          ok: true,
-          filePath,
-          suggestedFilename: targetName,
-          src: imgInfo.src,
-          index: imgInfo.index,
-          total: imgInfo.total,
-        };
-      } catch (err) {
-        return {
-          ok: false,
-          error: err.message,
-          src: imgInfo.src,
-          index: imgInfo.index,
-          total: imgInfo.total,
-        };
+          const img = imgs[i];
+          img.scrollIntoView({ behavior: 'instant', block: 'center' });
+          const rect = img.getBoundingClientRect();
+          return {
+            ok: true,
+            x: rect.left + rect.width / 2,
+            y: rect.top + rect.height / 2,
+            src: sourceOf(img),
+            index: i,
+            total: imgs.length,
+          };
+        }, index, urlWasProvided ? imageUrl : null);
+      } catch (error) {
+        return baseResult(null, { error: error?.message || 'image_selection_failed' });
       }
+      if (!selected?.ok) return selected || baseResult(null, { error: 'image_selection_failed' });
+
+      await sleep(500);
+      let buttonInfo;
+      try {
+        await page.mouse.move(selected.x, selected.y);
+        await sleep(800);
+        buttonInfo = await op.query((targetIndex, expectedSrc, selectors) => {
+          const imgs = [...document.querySelectorAll('img.image.loaded')];
+          if (targetIndex < 0 || targetIndex >= imgs.length) {
+            return { ok: false, error: 'image_changed', total: imgs.length };
+          }
+          const img = imgs[targetIndex];
+          const src = img.currentSrc || img.src || '';
+          const normalized = value => {
+            try { return new URL(value, location.href).href; } catch { return String(value || ''); }
+          };
+          if (normalized(src) !== normalized(expectedSrc)) {
+            return { ok: false, error: 'image_changed', total: imgs.length };
+          }
+
+          const visible = element => {
+            const rect = element.getBoundingClientRect();
+            if (!(rect.width > 0 && rect.height > 0)) return false;
+            const style = getComputedStyle(element);
+            return style.display !== 'none' && style.visibility !== 'hidden';
+          };
+          let scope = img.parentElement;
+          for (let depth = 0; scope && scope !== document.body && depth < 14; depth++, scope = scope.parentElement) {
+            const scopedImages = [...scope.querySelectorAll('img.image.loaded')];
+            if (scopedImages.length !== 1 || scopedImages[0] !== img) continue;
+            for (const selector of selectors) {
+              let candidates = [];
+              try { candidates = [...scope.querySelectorAll(selector)]; } catch { /* unsupported selector */ }
+              for (const element of candidates) {
+                const button = element.tagName === 'BUTTON'
+                  ? element
+                  : element.querySelector('button') || element.closest('button') || element;
+                if (!visible(button)) continue;
+                const rect = button.getBoundingClientRect();
+                const x = rect.left + rect.width / 2;
+                const y = rect.top + rect.height / 2;
+                let coordinateHit = null;
+                try { coordinateHit = document.elementFromPoint?.(x, y) || null; } catch { /* prefer the deterministic DOM path */ }
+                let coordinateCanReachButton = false;
+                try {
+                  coordinateCanReachButton = !!coordinateHit
+                    && (coordinateHit === button || button.contains?.(coordinateHit) === true);
+                } catch { /* prefer the deterministic DOM path */ }
+                return {
+                  ok: true,
+                  x,
+                  y,
+                  selector,
+                  clickStrategy: coordinateCanReachButton ? 'coordinate' : 'dom',
+                  downloadUrl: button.href || button.getAttribute?.('href') || button.getAttribute?.('data-url') || '',
+                };
+              }
+            }
+          }
+          return { ok: false, error: 'full_size_download_btn_not_found' };
+        }, selected.index, selected.src, SELECTORS.downloadFullSizeBtn);
+      } catch (error) {
+        return baseResult(selected, { error: error?.message || 'download_button_lookup_failed' });
+      }
+      if (!buttonInfo?.ok) return baseResult(selected, { error: buttonInfo?.error || 'full_size_download_btn_not_found' });
+
+      let workspace;
+      let browserSession;
+      let pageSession;
+      let lifecycle;
+      let pageFrameListeners = [];
+      let pendingPageFrames = [];
+      let eventPromiseConsumed = false;
+      let downloadBehaviorChanged = false;
+      let restoreError = null;
+      let outcome;
+      try {
+        const browser = page.browser?.();
+        const browserTarget = browser?.target?.();
+        if (!browserTarget || typeof browserTarget.createCDPSession !== 'function'
+          || typeof page.createCDPSession !== 'function') {
+          return baseResult(selected, { error: 'public_cdp_session_unavailable' });
+        }
+
+        browserSession = await browserTarget.createCDPSession();
+        pageSession = await page.createCDPSession();
+        const queuePageFrame = (childFrameId, parentFrameId) => {
+          if (lifecycle) lifecycle.addFrame(childFrameId, parentFrameId);
+          else pendingPageFrames.push([childFrameId, parentFrameId]);
+        };
+        if (typeof pageSession.on === 'function') {
+          const onFrameAttached = event => queuePageFrame(event?.frameId, event?.parentFrameId);
+          const onFrameNavigated = event => queuePageFrame(event?.frame?.id, event?.frame?.parentId);
+          pageSession.on('Page.frameAttached', onFrameAttached);
+          pageSession.on('Page.frameNavigated', onFrameNavigated);
+          pageFrameListeners = [
+            ['Page.frameAttached', onFrameAttached],
+            ['Page.frameNavigated', onFrameNavigated],
+          ];
+        }
+        await pageSession.send('Page.enable');
+        const frameResult = await pageSession.send('Page.getFrameTree');
+        const frame = frameResult?.frameTree?.frame;
+        if (!frame?.id) return baseResult(selected, { error: 'main_frame_unavailable' });
+        const frameIds = [];
+        const collectFrameIds = treeNode => {
+          if (!treeNode) return;
+          if (treeNode.frame?.id) frameIds.push(treeNode.frame.id);
+          for (const child of treeNode.childFrames || []) collectFrameIds(child);
+        };
+        collectFrameIds(frameResult.frameTree);
+
+        workspace = createDownloadWorkspace(config.outputDir);
+        downloadBehaviorChanged = true;
+        await browserSession.send('Browser.setDownloadBehavior', {
+          behavior: 'allow',
+          downloadPath: workspace.directory,
+          eventsEnabled: true,
+        });
+        lifecycle = createDownloadLifecycle(browserSession, {
+          frameId: frame.id,
+          frameIds,
+          imageUrl: selected.src,
+          resourceUrls: [buttonInfo.downloadUrl],
+          timeout: Math.max(1, requestedTimeout),
+        });
+        for (const [childFrameId, parentFrameId] of pendingPageFrames) {
+          lifecycle.addFrame(childFrameId, parentFrameId);
+        }
+        pendingPageFrames = [];
+
+        lifecycle.arm();
+        if (buttonInfo.clickStrategy === 'coordinate') {
+          // The event may be delayed; never retry a dispatched input action.
+          lifecycle.setClickStatus('coordinate', 'attempting');
+          try {
+            await page.mouse.click(buttonInfo.x, buttonInfo.y);
+            lifecycle.setClickStatus('coordinate', 'dispatched');
+          } catch (error) {
+            lifecycle.setClickStatus('coordinate', 'dispatch_error');
+            throw error;
+          }
+        } else {
+          // Decide DOM-vs-coordinate before dispatch. Once this single action is
+          // attempted, a missing/late CDP event is a timeout, not a retry signal.
+          lifecycle.setClickStatus('dom', 'attempting');
+          let fallbackResult;
+          try {
+            fallbackResult = await op.query((targetIndex, expectedSrc, selectors) => {
+            const imgs = [...document.querySelectorAll('img.image.loaded')];
+            if (targetIndex < 0 || targetIndex >= imgs.length) return { ok: false, error: 'image_changed' };
+            const img = imgs[targetIndex];
+            const src = img.currentSrc || img.src || '';
+            const normalized = value => {
+              try { return new URL(value, location.href).href; } catch { return String(value || ''); }
+            };
+            if (normalized(src) !== normalized(expectedSrc)) return { ok: false, error: 'image_changed' };
+            const visible = element => {
+              const rect = element.getBoundingClientRect();
+              if (!(rect.width > 0 && rect.height > 0)) return false;
+              const style = getComputedStyle(element);
+              return style.display !== 'none' && style.visibility !== 'hidden';
+            };
+            let scope = img.parentElement;
+            for (let depth = 0; scope && scope !== document.body && depth < 14; depth++, scope = scope.parentElement) {
+              const scopedImages = [...scope.querySelectorAll('img.image.loaded')];
+              if (scopedImages.length !== 1 || scopedImages[0] !== img) continue;
+              for (const selector of selectors) {
+                let candidates = [];
+                try { candidates = [...scope.querySelectorAll(selector)]; } catch { /* unsupported selector */ }
+                for (const element of candidates) {
+                  const button = element.tagName === 'BUTTON'
+                    ? element
+                    : element.querySelector('button') || element.closest('button') || element;
+                  if (!visible(button)) continue;
+                  button.click();
+                  return { ok: true, selector, dispatched: true };
+                }
+              }
+            }
+            return { ok: false, error: 'full_size_download_btn_not_found' };
+            }, selected.index, selected.src, SELECTORS.downloadFullSizeBtn);
+          } catch (error) {
+            lifecycle.setClickStatus('dom', 'dispatch_error');
+            throw error;
+          }
+          lifecycle.setClickStatus('dom', fallbackResult?.dispatched ? 'dispatched' : 'not_dispatched');
+          if (!fallbackResult?.ok) lifecycle.cancel(fallbackResult?.error || 'full_size_download_btn_not_found');
+        }
+
+        eventPromiseConsumed = true;
+        const download = await lifecycle.promise;
+        if (!download.ok) {
+          outcome = baseResult(selected, { error: download.error });
+        } else {
+          const file = workspace.finalize(download);
+          if (!file.ok) {
+            outcome = baseResult(selected, { error: file.error, filePath: file.filePath });
+          } else {
+            // Preserve the current fullSize contract; optional/conditional
+            // watermark behavior is intentionally left for the second pass.
+            const wmResult = await removeWatermarkFromFile(file.filePath);
+            if (wmResult.ok && !wmResult.skipped) {
+              console.log(`[ops] 水印已移除 (${wmResult.width}×${wmResult.height}, logo=${wmResult.logoSize}px)`);
+            } else if (wmResult.skipped) {
+              console.log(`[ops] 跳过去水印: ${wmResult.reason}`);
+            } else {
+              console.warn(`[ops] 去水印失败（不影响下载结果）: ${wmResult.error}`);
+            }
+            outcome = {
+              ok: true,
+              filePath: file.filePath,
+              suggestedFilename: file.suggestedFilename,
+              src: selected.src,
+              index: selected.index,
+              total: selected.total,
+            };
+          }
+        }
+      } catch (error) {
+        outcome = baseResult(selected, { error: error?.message || 'download_failed' });
+      } finally {
+        if (lifecycle) {
+          if (!eventPromiseConsumed) {
+            lifecycle.cancel('download_aborted');
+            await lifecycle.promise;
+          }
+          lifecycle.cleanup();
+        }
+        for (const [eventName, handler] of pageFrameListeners) {
+          try {
+            if (typeof pageSession?.off === 'function') pageSession.off(eventName, handler);
+            else pageSession?.removeListener?.(eventName, handler);
+          } catch { /* page target may already be detached */ }
+        }
+        pageFrameListeners = [];
+        if (downloadBehaviorChanged && browserSession) {
+          try {
+            await browserSession.send('Browser.setDownloadBehavior', { behavior: 'default', eventsEnabled: false });
+          } catch (error) {
+            restoreError = error?.message || 'download_behavior_restore_failed';
+          }
+        }
+        for (const session of [pageSession, browserSession]) {
+          try { await session?.detach?.(); } catch { /* detached or target closed */ }
+        }
+      }
+      if (restoreError) {
+        if (outcome?.ok) {
+          outcome = { ...outcome, ok: false, error: 'download_behavior_restore_failed', detail: restoreError };
+        } else if (outcome) {
+          outcome.restoreError = restoreError;
+        }
+      }
+      if (outcome && workspace && existsSync(workspace.directory)) {
+        outcome.downloadDir = workspace.directory;
+      }
+      if (outcome && lifecycle) {
+        const diagnostics = lifecycle.getDiagnostics();
+        if (outcome.error && workspace) {
+          diagnostics.downloadDirectory = workspace.directory;
+          diagnostics.downloadDirectoryEntries = workspace.inspect();
+        }
+        outcome.diagnostics = diagnostics;
+        const line = `[ops] full-size download diagnostics: ${JSON.stringify(diagnostics)}`;
+        if (outcome.error) console.warn(line);
+        else console.info(line);
+      }
+      return outcome || baseResult(selected, { error: 'download_failed' });
     },
 
     /**
@@ -1679,52 +2365,168 @@ export function createOps(page) {
      * @returns {Promise<{ok: boolean, elapsed: number, finalStatus?: object, error?: string}>}
      */
     async sendAndWait(prompt, opts = {}) {
-      const { timeout = 120_000, interval = 1_000, onPoll } = opts;
+      const {
+        timeout = 120_000,
+        interval = 1_000,
+        onPoll,
+        preSendDelay = 300,
+      } = opts;
+      const start = Date.now();
+      const deadline = start + Math.max(0, timeout);
 
-      // 1. 填写
-      const fillResult = await this.fillPrompt(prompt);
-      if (!fillResult.ok) {
-        return { ok: false, error: 'fill_failed', detail: fillResult, elapsed: 0 };
+      if (page?.isClosed?.()) return { ok: false, error: 'page_closed', elapsed: 0 };
+
+      let initialStatus;
+      try {
+        initialStatus = await this.getStatus();
+      } catch (error) {
+        return { ok: false, error: page?.isClosed?.() ? 'page_closed' : 'status_unavailable', detail: error.message, elapsed: Date.now() - start };
+      }
+      if (initialStatus.status === 'stop') {
+        return { ok: false, error: 'previous_generation_active', finalStatus: initialStatus, elapsed: Date.now() - start };
+      }
+      if (!['mic', 'submit'].includes(initialStatus.status)) {
+        return { ok: false, error: 'answer_state_unknown', finalStatus: initialStatus, elapsed: Date.now() - start };
       }
 
-      // 短暂等待 UI 响应
-      await sleep(300);
+      // Take the turn/image baseline before touching the composer. This is
+      // intentionally scoped to model response nodes, not user attachments.
+      let baseline;
+      try {
+        baseline = await this.getResponseSnapshot();
+      } catch (error) {
+        return { ok: false, error: page?.isClosed?.() ? 'page_closed' : 'page_changed', detail: error.message, elapsed: Date.now() - start };
+      }
+      if (!baseline?.ok) return { ok: false, error: baseline?.error || 'response_snapshot_failed', elapsed: Date.now() - start };
 
-      // 2. 点击发送
-      const clickResult = await this.click('sendBtn');
+      // Recheck immediately before filling: the page may still be finishing a
+      // previous request whose browser session lease has already been released.
+      try {
+        initialStatus = await this.getStatus();
+      } catch (error) {
+        return { ok: false, error: page?.isClosed?.() ? 'page_closed' : 'status_unavailable', detail: error.message, elapsed: Date.now() - start };
+      }
+      if (initialStatus.status === 'stop') {
+        return { ok: false, error: 'previous_generation_active', finalStatus: initialStatus, elapsed: Date.now() - start };
+      }
+      if (!['mic', 'submit'].includes(initialStatus.status)) {
+        return { ok: false, error: 'answer_state_unknown', finalStatus: initialStatus, elapsed: Date.now() - start };
+      }
+
+      let fillResult;
+      try {
+        fillResult = await this.fillPrompt(prompt);
+      } catch (error) {
+        return { ok: false, error: page?.isClosed?.() ? 'page_closed' : 'fill_failed', detail: error.message, elapsed: Date.now() - start };
+      }
+      if (!fillResult.ok) {
+        return { ok: false, error: 'fill_failed', detail: fillResult, elapsed: Date.now() - start };
+      }
+      if (Date.now() >= deadline) return { ok: false, error: 'timeout', elapsed: Date.now() - start };
+      await sleep(Math.min(preSendDelay, Math.max(0, deadline - Date.now())));
+
+      let clickReadyStatus;
+      try {
+        clickReadyStatus = await this.getStatus();
+      } catch (error) {
+        return { ok: false, error: page?.isClosed?.() ? 'page_closed' : 'status_unavailable', detail: error.message, elapsed: Date.now() - start };
+      }
+      if (clickReadyStatus.status === 'stop') {
+        return { ok: false, error: 'previous_generation_active', finalStatus: clickReadyStatus, elapsed: Date.now() - start };
+      }
+      if (clickReadyStatus.status !== 'submit') {
+        return { ok: false, error: 'send_not_ready', finalStatus: clickReadyStatus, elapsed: Date.now() - start };
+      }
+      let beforeClickSnapshot;
+      try {
+        beforeClickSnapshot = await this.getResponseSnapshot();
+      } catch (error) {
+        return { ok: false, error: page?.isClosed?.() ? 'page_closed' : 'page_changed', detail: error.message, elapsed: Date.now() - start };
+      }
+      if (beforeClickSnapshot?.pageKey !== baseline.pageKey) {
+        return { ok: false, error: 'page_changed', elapsed: Date.now() - start };
+      }
+      if (Date.now() >= deadline) return { ok: false, error: 'timeout', elapsed: Date.now() - start };
+
+      let clickResult;
+      try {
+        clickResult = await this.click('sendBtn');
+      } catch (error) {
+        return { ok: false, error: page?.isClosed?.() ? 'page_closed' : 'send_click_failed', detail: error.message, elapsed: Date.now() - start };
+      }
       console.log(`[ops] 发送按钮点击结果:`, clickResult);
       if (!clickResult.ok) {
-        return { ok: false, error: 'send_click_failed', detail: clickResult, elapsed: 0 };
+        return { ok: false, error: 'send_click_failed', detail: clickResult, elapsed: Date.now() - start };
       }
 
-      // 3. 轮询等待（回到麦克风态 = Gemini 回答完毕）
-      const start = Date.now();
       let lastStatus = null;
+      let selectedIndex = null;
+      let stableFingerprint = null;
+      let stableSamples = 0;
+      let acceptedPageKey = null;
 
-      while (Date.now() - start < timeout) {
-        await sleep(interval);
+      while (Date.now() < deadline) {
+        if (page?.isClosed?.()) return { ok: false, error: 'page_closed', elapsed: Date.now() - start, finalStatus: lastStatus };
+        if (interval > 0) await sleep(Math.min(interval, Math.max(0, deadline - Date.now())));
 
-        const poll = await this.pollStatus();
+        let poll;
+        let snapshot;
+        try {
+          poll = await this.pollStatus();
+          snapshot = await this.getResponseSnapshot();
+        } catch (error) {
+          return { ok: false, error: page?.isClosed?.() ? 'page_closed' : 'page_changed', detail: error.message, elapsed: Date.now() - start, finalStatus: lastStatus };
+        }
         lastStatus = poll;
         onPoll?.(poll);
 
-        if (poll.status === 'mic') {
-          // 回复完成，自动提取最新文字回复
-          const textResp = await this.getLatestTextResponse();
-          return {
-            ok: true,
-            elapsed: Date.now() - start,
-            finalStatus: poll,
-            text: textResp.ok ? textResp.text : null,
-            textIndex: textResp.ok ? textResp.index : null,
-          };
+        const selected = findNewResponse(baseline, snapshot, { prompt, acceptedPageKey });
+        if (selected?.error) {
+          return { ok: false, error: selected.error, elapsed: Date.now() - start, finalStatus: poll };
         }
-        if (poll.status === 'unknown') {
-          console.warn('[ops] unknown status, may need screenshot to debug');
+        if (selected?.pendingPageKey) acceptedPageKey = selected.pendingPageKey;
+
+        if (selected?.response) {
+          selectedIndex = selected.index;
+          const fingerprint = responseFingerprint(selected.response);
+          acceptedPageKey = selected.pageKey || acceptedPageKey;
+          if (poll.status !== 'mic' || selected.response.loader) {
+            stableFingerprint = fingerprint;
+            stableSamples = 0;
+            continue;
+          }
+
+          if (fingerprint === stableFingerprint) stableSamples++;
+          else {
+            stableFingerprint = fingerprint;
+            stableSamples = 1;
+          }
+
+          // Require the same new response on two non-generating observations.
+          // This handles fast replies that never expose the stop button while
+          // avoiding success on an old answer merely because the mic is idle.
+          if (stableSamples >= 2) {
+            return {
+              ok: true,
+              elapsed: Date.now() - start,
+              finalStatus: poll,
+              text: selected.response.text || null,
+              textIndex: selected.index,
+              responseIndex: selected.index,
+              responseIdentity: selected.response.identity,
+              responsePageKey: acceptedPageKey || baseline.pageKey,
+              responseImageBaseline: baseline.imageSources || [],
+            };
+          }
+        } else {
+          stableFingerprint = null;
+          stableSamples = 0;
         }
+
+        if (poll.status === 'unknown') console.warn('[ops] unknown status, may need screenshot to debug');
       }
 
-      return { ok: false, error: 'timeout', elapsed: Date.now() - start, finalStatus: lastStatus };
+      return { ok: false, error: 'timeout', elapsed: Date.now() - start, finalStatus: lastStatus, responseIndex: selectedIndex };
     },
 
     /**
@@ -1737,31 +2539,66 @@ export function createOps(page) {
      * @param {(status: object) => void} [opts.onPoll]
      */
     async generateImage(prompt, opts = {}) {
-      const { timeout = 120_000, fullSize = false, onPoll } = opts;
+      const { timeout = 120_000, fullSize = false, onPoll, interval = 1_000, preSendDelay } = opts;
 
       // 1. 发送并等待
-      const waitResult = await this.sendAndWait(prompt, { timeout, onPoll });
+      const waitResult = await this.sendAndWait(prompt, { timeout, interval, preSendDelay, onPoll });
       if (!waitResult.ok) {
         return { ...waitResult, step: 'sendAndWait' };
       }
 
-      // 3. 等图片渲染完成
-      await sleep(2000);
-
-      // 4. 获取图片
-      let imgInfo = await this.getLatestImage();
-      if (!imgInfo.ok) {
-        await sleep(3000);
-        imgInfo = await this.getLatestImage();
-        if (!imgInfo.ok) {
-          return { ok: false, error: 'no_image_found', elapsed: waitResult.elapsed, imgInfo };
+      // A complete text-only response has no image descendants. For image
+      // responses, keep polling that response's own nodes until an actual
+      // image load is complete; never fall back to the page's historical tail.
+      const deadline = Date.now() + Math.max(0, timeout - (waitResult.elapsed || 0));
+      const baselineSources = new Set(waitResult.responseImageBaseline || []);
+      let imgInfo = null;
+      let lastImageState = null;
+      while (Date.now() <= deadline) {
+        if (page?.isClosed?.()) return { ok: false, error: 'page_closed', step: 'getResponseImages', elapsed: waitResult.elapsed };
+        try {
+          lastImageState = await this.getResponseImages({
+            index: waitResult.responseIndex,
+            identity: waitResult.responseIdentity,
+            pageKey: waitResult.responsePageKey,
+          });
+        } catch (error) {
+          return { ok: false, error: page?.isClosed?.() ? 'page_closed' : 'page_changed', detail: error.message, step: 'getResponseImages', elapsed: waitResult.elapsed };
         }
+        if (!lastImageState?.ok) {
+          return { ok: false, error: lastImageState?.error || 'page_changed', step: 'getResponseImages', elapsed: waitResult.elapsed };
+        }
+
+        const newImages = (lastImageState.images || []).filter(image => image.src && !baselineSources.has(image.src));
+        const candidate = newImages.at(-1);
+        if (candidate?.loaded && candidate.width > 0) {
+          imgInfo = { ok: true, ...candidate, isNew: true };
+          break;
+        }
+        if (!candidate && !lastImageState.loader) {
+          return { ok: false, error: 'NO_NEW_IMAGE', elapsed: waitResult.elapsed, responseIndex: waitResult.responseIndex, responseText: waitResult.text };
+        }
+        if (Date.now() >= deadline) break;
+        await sleep(Math.min(200, Math.max(1, deadline - Date.now())));
+      }
+      if (!imgInfo) {
+        return {
+          ok: false,
+          error: 'image_load_timeout',
+          elapsed: waitResult.elapsed,
+          responseIndex: waitResult.responseIndex,
+          image: lastImageState?.images?.at(-1) || null,
+        };
       }
 
       // 5. 提取 / 下载
       if (fullSize) {
         // 完整尺寸下载：通过 CDP 拦截，文件保存到 config.outputDir
-        const dlResult = await this.downloadFullSizeImage();
+        const dlResult = await this.downloadFullSizeImage({
+          index: imgInfo.index,
+          imageUrl: imgInfo.src,
+          timeout: Math.max(1, deadline - Date.now()),
+        });
         return { ok: dlResult.ok, method: 'fullSize', elapsed: waitResult.elapsed, ...dlResult };
       } else {
         // 低分辨率：提取页面预览图的 base64
@@ -1830,25 +2667,73 @@ function isImageLoaded(op) {
 /**
  * 检查是否已登录 Google 账号
  *
- * 判断依据：顶部导航栏 div.boqOnegoogleliteOgbOneGoogleBar 的 innerText
- * 包含"登录"或"sign in"（不区分大小写）则视为未登录
+ * 只有明确登录提示或可见 Gemini 编辑器才判定登录状态；空导航栏及未知 UI 不作为登录证据。
  *
  * @param {ReturnType<typeof createOperator>} op
  * @returns {Promise<{ok: boolean, loggedIn: boolean, barText?: string, error?: string}>}
  */
 function isLoggedIn(op) {
-  return op.query(() => {
+  return op.query((editorSelectors) => {
+    const isVisible = (el) => {
+      if (!el) return false;
+      const rect = el.getBoundingClientRect?.();
+      if (!rect || rect.width <= 0 || rect.height <= 0) return false;
+      const style = getComputedStyle(el);
+      return style.display !== 'none' && style.visibility !== 'hidden';
+    };
     const bar = document.querySelector('div.boqOnegoogleliteOgbOneGoogleBar');
-    if (!bar) {
-      return { ok: false, loggedIn: false, error: 'login_bar_not_found' };
+    const text = (bar?.innerText || '').trim();
+    let hostname = '';
+    let pathname = '';
+    try {
+      const url = new URL(location.href);
+      hostname = url.hostname;
+      pathname = url.pathname;
+    } catch { /* Classify missing URL as an unready page below. */ }
+    if (hostname === 'accounts.google.com') {
+      const authError = /unknownerror/i.test(pathname);
+      return {
+        ok: true,
+        loggedIn: false,
+        state: authError ? 'auth_error' : 'login_required',
+        error: authError ? 'authentication_error' : 'login_required',
+        barText: text,
+      };
     }
 
-    const text = (bar.innerText || '').trim();
-    const lower = text.toLowerCase();
-    const notLoggedIn = lower.includes('登录') || lower.includes('sign in');
+    const loginControls = [...document.querySelectorAll('a,button,[role="button"],input[type="submit"]')];
+    const loginButtonVisible = loginControls.some((el) => {
+      if (!isVisible(el)) return false;
+      const label = `${el.innerText || el.textContent || ''} ${el.getAttribute?.('aria-label') || ''} ${el.value || ''}`;
+      return /sign\s*in|log\s*in|登录|登入/i.test(label);
+    });
+    const visibleText = (document.body?.innerText || '').replace(/[\t\r\n ]+/g, ' ').trim();
+    if (loginButtonVisible || /sign\s*in|log\s*in|登录|登入/i.test(`${text} ${visibleText}`)) {
+      return { ok: true, loggedIn: false, state: 'login_required', error: 'login_required', barText: text };
+    }
 
-    return { ok: true, loggedIn: !notLoggedIn, barText: text };
-  });
+    let editorVisible = false;
+    for (const selector of editorSelectors) {
+      try {
+        if ([...document.querySelectorAll(selector)].some(isVisible)) {
+          editorVisible = true;
+          break;
+        }
+      } catch { /* Ignore unsupported selectors. */ }
+    }
+    if (editorVisible) {
+      return { ok: true, loggedIn: true, state: 'ready', barText: text };
+    }
+
+    const state = bar || hostname === 'gemini.google.com' ? 'page_not_ready' : 'unsupported_ui';
+    return {
+      ok: false,
+      loggedIn: false,
+      state,
+      error: state,
+      barText: text,
+    };
+  }, SELECTORS.promptInput);
 }
 
 /**

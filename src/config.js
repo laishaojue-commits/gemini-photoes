@@ -76,6 +76,12 @@ for (const [key, value] of Object.entries(baseEnv)) {
 }
 
 const env = process.env;
+const browserProtocolTimeout = envInt('BROWSER_PROTOCOL_TIMEOUT', 60_000);
+const browserAcquireTimeoutMs = Math.max(
+  90_000,
+  browserProtocolTimeout + 30_000,
+  envInt('BROWSER_ACQUIRE_TIMEOUT_MS', 0),
+);
 
 /** 辅助：读取布尔型环境变量 */
 function envBool(key, fallback) {
@@ -122,7 +128,10 @@ const config = {
   browserHeadless: envBool('BROWSER_HEADLESS', false),
 
   /** CDP 协议超时时间（ms） */
-  browserProtocolTimeout: envInt('BROWSER_PROTOCOL_TIMEOUT', 60_000),
+  browserProtocolTimeout,
+
+  /** Daemon 首次冷启动浏览器的 HTTP acquire 超时时间（ms） */
+  browserAcquireTimeoutMs,
 
   /** 截图 / 图片输出目录 */
   outputDir: envStr('OUTPUT_DIR', join(projectRoot, 'gemini-image')),
@@ -148,6 +157,10 @@ const config = {
 
   /** Daemon 闲置超时时间（ms），超时后自动终止浏览器释放资源 */
   daemonTTL: envInt('DAEMON_TTL_MS', 30 * 60 * 1000),
+
+  /** Gemini 单页互斥 lease 时长与跨进程等待上限（ms） */
+  sessionLeaseMs: envInt('SESSION_LEASE_MS', 10 * 60 * 1000),
+  sessionLeaseWaitMs: envInt('SESSION_LEASE_WAIT_MS', 4 * 60 * 1000),
 };
 
 export default config;

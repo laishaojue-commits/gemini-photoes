@@ -25,6 +25,8 @@ console.debug = console.error;
 import { createAtlasProvider, createGeminiSession, disconnect } from './index.js';
 import config from './config.js';
 import { sleep } from './util.js';
+import { createMutex, createSessionTaskRunner } from './session-queue.js';
+import { runImageGeneration } from './image-generation-flow.js';
 
 const server = new McpServer({
   name: "gemini-mcp-server",
@@ -32,6 +34,12 @@ const server = new McpServer({
 });
 
 const atlasProvider = createAtlasProvider();
+const runGeminiPageTask = createSessionTaskRunner({ mutex: createMutex(), disconnect });
+const registerGeminiTool = (name, toolConfig, handler) => server.registerTool(
+  name,
+  toolConfig,
+  (...args) => runGeminiPageTask(() => handler(...args)),
+);
 
 // ─── Atlas Cloud Provider ───
 const atlasMessageSchema = z.array(
@@ -143,7 +151,7 @@ server.registerTool(
 );
 
 // 注册工具
-server.registerTool(
+registerGeminiTool(
   "gemini_generate_image",
   {
     description: `调用后台的 Gemini 浏览器会话生成高质量图片。
@@ -161,6 +169,12 @@ server.registerTool(
       referenceImages: z.array(z.string()).default([]).describe(
         "参考图片的本地文件路径数组，例如 [\"/path/to/ref1.png\", \"/path/to/ref2.jpg\"]。图片会在发送 prompt 前上传到 Gemini 输入框"
       ),
+      model: z.enum(["argon", "latest", "pro", "flash", "flash-lite"]).default("argon").describe(
+        "生成模型，默认 argon（Gemini 4 Argon）；latest 表示按当前菜单动态选择最新模型；也可显式选择 pro、flash 或 flash-lite"
+      ),
+      thinkingLevel: z.enum(["low", "medium", "high", "standard", "extended"]).default("high").describe(
+        "思考等级，默认 high；支持 low/medium/high，兼容 standard→medium、extended→high"
+      ),
       fullSize: z.boolean().default(true).describe(
         "是否下载完整尺寸原图。true= 通过 CDP 拦截下载高清大图; false= 提取页面预览图"
       ),
@@ -169,7 +183,7 @@ server.registerTool(
       ),
     },
   },
-  async ({ prompt, newSession, referenceImages, fullSize, timeout }) => {
+  async ({ prompt, newSession, referenceImages, model, thinkingLevel, fullSize, timeout }) => {
     try {
       const { ops } = await createGeminiSession();
 
@@ -182,40 +196,24 @@ server.registerTool(
           isError: true,
         };
       }
-      // 检查是否需要新建会话
-      if (newSession) {
-        await ops.click('newChatBtn');
-        await sleep(250);
+      const generation = await runImageGeneration(ops, {
+        prompt, newSession, model, thinkingLevel, referenceImages, fullSize, timeout,
+        onUpload: (imagePath, count) => {
+          if (imagePath) console.error(`[mcp] 正在上传参考图: ${imagePath}`);
+          else if (count) console.error(`[mcp] ${count} 张参考图上传完成`);
+        },
+      });
+      if (!generation.ok) {
+        const message = generation.stage === 'new_chat'
+          ? `新建会话失败: ${generation.error}`
+          : generation.stage === 'model'
+            ? `切换 ${model} 模型失败: ${generation.error}`
+            : generation.stage === 'thinking'
+              ? `设置 ${thinkingLevel} 思考等级失败: ${generation.error}`
+              : `参考图上传失败: ${generation.path}\n错误: ${generation.error}`;
+        return { content: [{ type: "text", text: message }], isError: true };
       }
-
-      // 确保是 pro 模型（生图需要 Pro）
-      await ops.ensureModelPro();
-
-      // 如果有参考图，需要上传参考图
-      if (referenceImages.length > 0) {
-
-        for (const imgPath of referenceImages) {
-          console.error(`[mcp] 正在上传参考图: ${imgPath}`);
-          const uploadResult = await ops.uploadImage(imgPath);
-          if (!uploadResult.ok) {
-            disconnect();
-            return {
-              content: [{ type: "text", text: `参考图上传失败: ${imgPath}\n错误: ${uploadResult.error}` }],
-              isError: true,
-            };
-          }
-        }
-        console.error(`[mcp] ${referenceImages.length} 张参考图上传完成`);
-      }
-
-
-      // 新建会话（如需）
-      if (newSession) {
-        await ops.click('newChatBtn');
-        await sleep(250);
-      }
-
-      const result = await ops.generateImage(prompt, { fullSize, timeout });
+      const result = generation.result;
 
       // 执行完毕立刻断开，交还给 Daemon 倒计时
       disconnect();
@@ -266,7 +264,7 @@ server.registerTool(
 // ─── 会话管理 ───
 
 // 新建会话
-server.registerTool(
+registerGeminiTool(
   "gemini_new_chat",
   {
     description: "在 Gemini 中新建一个空白对话",
@@ -289,7 +287,7 @@ server.registerTool(
 );
 
 // 临时会话
-server.registerTool(
+registerGeminiTool(
   "gemini_temp_chat",
   {
     description: "进入 Gemini 临时对话模式（不保留历史记录，适合隐私场景）。注意：临时会话按钮仅在空白新会话页面可见，本工具会自动先新建会话再进入临时模式",
@@ -324,12 +322,12 @@ server.registerTool(
 
 // ─── 模型切换 ───
 
-server.registerTool(
+registerGeminiTool(
   "gemini_switch_model",
   {
-    description: "切换 Gemini 模型（pro / flash / flash-lite）",
+    description: "切换 Gemini 模型（argon / latest / pro / flash / flash-lite）；latest 按当前菜单动态选择最新模型",
     inputSchema: {
-      model: z.enum(["pro", "flash", "flash-lite"]).describe("目标模型：pro=Gemini 3.1 Pro（高质量），flash=Gemini 3.5 Flash（平衡），flash-lite=Gemini 3.1 Flash-Lite（快速）"),
+      model: z.enum(["argon", "latest", "pro", "flash", "flash-lite"]).describe("目标模型：argon=Gemini 4 Argon，latest=当前菜单最新模型，pro=Gemini 3.1 Pro，flash=Gemini 3.8 Flash，flash-lite=Gemini 3.5 Flash-Lite"),
     },
   },
   async ({ model }) => {
@@ -350,12 +348,12 @@ server.registerTool(
   }
 );
 
-server.registerTool(
+registerGeminiTool(
   "gemini_set_thinking_depth",
   {
-    description: "切换 Gemini 思考深度（standard 标准 / extended 扩展）。仅在支持的模型下生效",
+    description: "切换 Gemini 思考等级（low / medium / high）；兼容 standard→medium、extended→high。当前模型不支持或缺少该选项时返回错误",
     inputSchema: {
-      level: z.enum(["standard", "extended"]).describe("思考深度：standard=标准思考，extended=扩展思考"),
+      level: z.enum(["low", "medium", "high", "standard", "extended"]).describe("思考等级：low、medium、high；旧值 standard 映射 medium，extended 映射 high"),
     },
   },
   async ({ level }) => {
@@ -378,7 +376,7 @@ server.registerTool(
 
 // ─── 文本对话 ───
 
-server.registerTool(
+registerGeminiTool(
   "gemini_send_message",
   {
     description: `向 Gemini 发送文本消息并等待回答完成（不提取图片，纯文本交互）。
@@ -413,7 +411,7 @@ server.registerTool(
 
 // ─── 图片上传 ───
 
-server.registerTool(
+registerGeminiTool(
   "gemini_upload_images",
   {
     description: "向 Gemini 当前输入框上传图片（仅上传，不发送消息），可配合 gemini_send_message 组合使用",
@@ -451,7 +449,7 @@ server.registerTool(
 
 // ─── 图片获取 ───
 
-server.registerTool(
+registerGeminiTool(
   "gemini_get_images",
   {
     description: "获取当前 Gemini 会话中所有已加载的图片列表（不下载，仅返回元信息）",
@@ -476,7 +474,7 @@ server.registerTool(
   }
 );
 
-server.registerTool(
+registerGeminiTool(
   "gemini_extract_image",
   {
     description: "提取指定图片的 base64 数据并保存到本地文件。可从 gemini_get_images 获取图片 src URL",
@@ -519,7 +517,7 @@ server.registerTool(
 
 // ─── 完整尺寸图片下载 ───
 
-server.registerTool(
+registerGeminiTool(
   "gemini_download_full_size_image",
   {
     description: `下载完整尺寸的图片（高清大图）。默认下载最新一张，也可通过 index 指定第几张（从0开始，从旧到新排列）。
@@ -554,7 +552,7 @@ server.registerTool(
   }
 );
 
-server.registerTool(
+registerGeminiTool(
   "gemini_share_latest_image",
   {
     description: `为当前会话中的图片创建 Gemini 公共分享链接并直接返回该链接。
@@ -601,7 +599,7 @@ server.registerTool(
 
 // ─── 文字回复获取 ───
 
-server.registerTool(
+registerGeminiTool(
   "gemini_get_all_text_responses",
   {
     description: "获取当前 Gemini 会话中所有文字回复内容（仅文字，不含图片等其他类型回复）",
@@ -626,7 +624,7 @@ server.registerTool(
   }
 );
 
-server.registerTool(
+registerGeminiTool(
   "gemini_get_latest_text_response",
   {
     description: "获取当前 Gemini 会话中最新一条文字回复（仅文字，不含图片等其他类型回复）",
@@ -653,7 +651,7 @@ server.registerTool(
 
 // ─── 登录状态检查 ───
 
-server.registerTool(
+registerGeminiTool(
   "gemini_check_login",
   {
     description: "检查当前 Gemini 页面是否已登录 Google 账号",
@@ -681,7 +679,7 @@ server.registerTool(
 
 // ─── 页面状态 & 恢复 ───
 
-server.registerTool(
+registerGeminiTool(
   "gemini_probe",
   {
     description: "探测 Gemini 页面各元素状态（输入框、按钮、当前模型等），用于调试和排查问题",
@@ -702,7 +700,7 @@ server.registerTool(
   }
 );
 
-server.registerTool(
+registerGeminiTool(
   "gemini_reload_page",
   {
     description: "刷新 Gemini 页面（页面卡住或状态异常时使用）",
@@ -728,7 +726,7 @@ server.registerTool(
 
 // ─── 页面导航 ───
 
-server.registerTool(
+registerGeminiTool(
   "gemini_navigate_to",
   {
     description: "打开指定的 Gemini 页面 URL（如特定会话链接）。仅允许 gemini.google.com 域名，其他域名会被拒绝。适用于需要恢复到某个历史会话继续对话的场景",
@@ -774,6 +772,7 @@ server.registerTool(
     try {
       // 1. 检查 Daemon 健康状态
       const healthRes = await fetch(`${daemonUrl}/health`, { signal: AbortSignal.timeout(3000) });
+      if (!healthRes.ok) throw new Error(`Daemon /health returned HTTP ${healthRes.status}`);
       const health = await healthRes.json();
 
       if (!health.ok) {
@@ -784,19 +783,20 @@ server.registerTool(
       }
 
       // 2. 获取浏览器连接信息
-      const acquireRes = await fetch(`${daemonUrl}/browser/acquire`, { signal: AbortSignal.timeout(5000) });
-      const acquire = await acquireRes.json();
+      const statusRes = await fetch(`${daemonUrl}/browser/status`, { signal: AbortSignal.timeout(5000) });
+      if (!statusRes.ok) throw new Error(`Daemon /browser/status returned HTTP ${statusRes.status}`);
+      const status = await statusRes.json();
 
       const info = {
         daemon: {
           url: daemonUrl,
           port: config.daemonPort,
-          status: "running",
+          status: status.status || "running",
         },
         browser: {
           cdpPort: config.browserDebugPort,
-          wsEndpoint: acquire.wsEndpoint || null,
-          pid: acquire.pid || null,
+          wsEndpoint: status.wsEndpoint || null,
+          pid: status.pid || null,
           headless: config.browserHeadless,
         },
         config: {

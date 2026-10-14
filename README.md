@@ -389,7 +389,7 @@ console.log(result.choices[0].message.content);
 
 | 工具名 | 说明 | 主要参数 |
 |--------|------|----------|
-| `gemini_generate_image` | 完整生图流程（耗时 60~120s） | `prompt`, `newSession`, `referenceImages`, `fullSize`, `timeout` |
+| `gemini_generate_image` | 完整生图流程（默认 Gemini 4 Argon + high 思考等级；耗时 60~120s） | `prompt`, `newSession`, `model`（默认 `argon`，可选 `latest` / `pro` / `flash` / `flash-lite`）, `thinkingLevel`（默认 `high`，可选 `low` / `medium` / `high`）, `referenceImages`, `fullSize`, `timeout` |
 
 ### 会话管理
 
@@ -403,7 +403,8 @@ console.log(result.choices[0].message.content);
 
 | 工具名 | 说明 | 主要参数 |
 |--------|------|----------|
-| `gemini_switch_model` | 切换模型（pro/quick/think） | `model` |
+| `gemini_switch_model` | 切换模型（argon/latest/pro/flash/flash-lite） | `model` |
+| `gemini_set_thinking_depth` | 切换思考等级（low/medium/high；兼容 standard/extended） | `level` |
 | `gemini_send_message` | 发送文本并等待回复（耗时 10~60s） | `message`, `timeout` |
 
 ### 图片操作

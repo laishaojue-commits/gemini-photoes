@@ -10,6 +10,7 @@
  *   下次 Skill 调用时会自动重新拉起。闲置时留一个空壳进程占端口没有意义。
  */
 import { terminateBrowser } from './engine.js';
+import { sessionLeaseManager } from './session-lease.js';
 
 const DEFAULT_TTL_MS = 30 * 60 * 1000; // 30 分钟
 
@@ -42,6 +43,11 @@ export function resetHeartbeat() {
   _lastHeartbeat = Date.now();
 
   _idleTimer = setTimeout(async () => {
+    if (sessionLeaseManager.getActiveLeaseCount() > 0) {
+      console.log('[lifecycle] Gemini session lease still active; extending browser lifetime');
+      resetHeartbeat();
+      return;
+    }
     console.log(`[lifecycle] 💤 ${(_ttlMs / 60000).toFixed(0)} 分钟未活动，终止浏览器并退出 Daemon`);
     await terminateBrowser();
 

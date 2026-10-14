@@ -6,6 +6,8 @@
   "scripts": {
     "mcp": "node src/mcp-server.js",
     "daemon": "node src/daemon/server.js",
+    "test": "node --experimental-vm-modules --test",
+    "check": "node scripts/check.mjs",
     "demo": "node src/demo.js",
     "demo2": "node src/demo2.js",
     "demo3": "node src/demo3.js"

@@ -55,7 +55,7 @@ MCP 工具调用（尤其是生图、等待回复等）可能耗时较长（60~1
 
 | 工具名 | 说明 | 入参 |
 |--------|------|------|
-| `gemini_generate_image` | 完整生图流程：新建会话→发prompt→等待→提取图片→保存本地（耗时约 60~120 秒） | `prompt`，`newSession`（默认false），`referenceImages`（参考图路径数组），`fullSize`（默认true，高清原图；false则预览图），`timeout`（默认120000ms） |
+| `gemini_generate_image` | 完整生图流程：新建会话→选择模型和思考等级→上传参考图→生成并保存本地（耗时约 60~120 秒） | `prompt`，`newSession`（默认false），`model`（默认 `argon`，即 Gemini 4 Argon；可选 `latest` 动态选择最新模型、`pro`、`flash`、`flash-lite`），`thinkingLevel`（默认 `high`，可选 `low` / `medium` / `high`；兼容 `standard`→`medium`、`extended`→`high`），`referenceImages`（参考图路径数组），`fullSize`（默认true，高清原图；false则预览图），`timeout`（默认180000ms） |
 
 **会话管理：**
 
@@ -68,7 +68,8 @@ MCP 工具调用（尤其是生图、等待回复等）可能耗时较长（60~1
 
 | 工具名 | 说明 | 入参 |
 |--------|------|------|
-| `gemini_switch_model` | 切换 Gemini 模型 | `model`（`pro` / `quick` / `think`） |
+| `gemini_switch_model` | 切换 Gemini 模型 | `model`（`argon` / `latest` / `pro` / `flash` / `flash-lite`；`latest`按当前菜单动态选择） |
+| `gemini_set_thinking_depth` | 切换思考等级 | `level`（`low` / `medium` / `high`；兼容 `standard` / `extended`） |
 
 **文本对话：**
 
@@ -124,10 +125,11 @@ MCP 工具调用（尤其是生图、等待回复等）可能耗时较长（60~1
 
 **灵活组合（细粒度控制）：**
 1. `gemini_new_chat` — 新建会话
-2. `gemini_switch_model` → `pro` — 切换到高质量模型
-3. `gemini_upload_images` — 上传参考图
-4. `gemini_send_message` — 发送描述词
-5. `gemini_get_images` → `gemini_extract_image` — 获取并保存图片
+2. `gemini_switch_model` → `argon` — 切换到 Gemini 4 Argon
+3. `gemini_set_thinking_depth` → `high` — 设置高思考等级
+4. `gemini_upload_images` — 上传参考图
+5. `gemini_send_message` — 发送描述词
+6. `gemini_get_images` → `gemini_extract_image` — 获取并保存图片
 
 **排障：**
 1. `gemini_probe` — 看看页面元素有没有就位

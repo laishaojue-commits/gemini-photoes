@@ -9,6 +9,68 @@
  */
 import { ensureBrowserForDaemon, getBrowser, terminateBrowser } from './engine.js';
 import { resetHeartbeat, getLifecycleInfo } from './lifecycle.js';
+import { sessionLeaseManager } from './session-lease.js';
+
+/** POST /session/acquire — wait for exclusive access to the shared Gemini page. */
+export async function handleSessionAcquire(req, res) {
+  let body;
+  try {
+    body = await readJSON(req);
+  } catch (err) {
+    sendJSON(res, 400, { ok: false, error: 'invalid_request', detail: err.message });
+    return;
+  }
+
+  const controller = new AbortController();
+  const onAborted = () => controller.abort();
+  const onClose = () => { if (!res.writableEnded) controller.abort(); };
+  if (req.aborted) controller.abort();
+  req.once('aborted', onAborted);
+  res.once('close', onClose);
+
+  try {
+    const lease = await sessionLeaseManager.acquire(body.ownerId, {
+      waitMs: body.waitMs,
+      signal: controller.signal,
+    });
+    if (!res.destroyed) sendJSON(res, 200, { ok: true, ...lease });
+  } catch (err) {
+    if (!res.destroyed) {
+      const statusCode = err.code === 'SESSION_LEASE_TIMEOUT' ? 408
+        : err.code === 'SESSION_LEASE_CANCELED' ? 499 : 400;
+      sendJSON(res, statusCode, { ok: false, error: err.code || 'lease_acquire_failed', detail: err.message });
+    }
+  } finally {
+    req.off('aborted', onAborted);
+    res.off('close', onClose);
+  }
+}
+
+/** POST /session/renew — keep an in-use lease alive while a tool is running. */
+export async function handleSessionRenew(req, res) {
+  try {
+    const { token } = await readJSON(req);
+    const lease = sessionLeaseManager.renew(token);
+    if (!lease) {
+      sendJSON(res, 409, { ok: false, error: 'lease_expired_or_unknown' });
+      return;
+    }
+    sendJSON(res, 200, { ok: true, ...lease });
+  } catch (err) {
+    sendJSON(res, 400, { ok: false, error: 'invalid_request', detail: err.message });
+  }
+}
+
+/** POST /session/release — release only the caller's token, never a browser instance. */
+export async function handleSessionRelease(req, res) {
+  try {
+    const { token } = await readJSON(req);
+    const released = sessionLeaseManager.release(token);
+    sendJSON(res, 200, { ok: true, released });
+  } catch (err) {
+    sendJSON(res, 400, { ok: false, error: 'invalid_request', detail: err.message });
+  }
+}
 
 /**
  * GET /browser/acquire
@@ -129,4 +191,23 @@ export function handleHealth(_req, res) {
 function sendJSON(res, statusCode, data) {
   res.writeHead(statusCode, { 'Content-Type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify(data));
+}
+
+function readJSON(req) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    req.setEncoding('utf8');
+    req.on('data', (chunk) => {
+      body += chunk;
+      if (body.length > 16_384) {
+        reject(new Error('Request body too large'));
+        req.destroy();
+      }
+    });
+    req.on('end', () => {
+      try { resolve(body ? JSON.parse(body) : {}); }
+      catch (err) { reject(err); }
+    });
+    req.on('error', reject);
+  });
 }

@@ -15,6 +15,7 @@
  *   disconnect()           ──▶     浏览器继续由 Daemon 守护
  */
 import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import puppeteerCore from 'puppeteer-core';
@@ -22,6 +23,7 @@ import { addExtra } from 'puppeteer-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import config from './config.js';
 import { sleep } from './util.js';
+import { createSingleFlight } from './session-queue.js';
 
 // connect 也套上 Stealth，双保险
 const puppeteer = addExtra(puppeteerCore);
@@ -34,6 +36,11 @@ const DAEMON_SCRIPT = join(__dirname, 'daemon', 'server.js');
 
 // ── 模块级单例 ──
 let _browser = null;
+let _leaseToken = null;
+let _leaseExpiresAt = null;
+let _leaseRenewTimer = null;
+let _disconnectPromise = null;
+const _ownerId = randomUUID();
 
 const DAEMON_URL = `http://127.0.0.1:${config.daemonPort}`;
 
@@ -42,6 +49,8 @@ const DAEMON_URL = `http://127.0.0.1:${config.daemonPort}`;
 const DAEMON_READY_TIMEOUT = 15_000;
 /** 轮询间隔（ms） */
 const DAEMON_POLL_INTERVAL = 500;
+const SESSION_LEASE_WAIT_MS = config.sessionLeaseWaitMs;
+const SESSION_LEASE_MS = config.sessionLeaseMs;
 
 /**
  * 检查 Daemon 是否存活
@@ -50,6 +59,7 @@ const DAEMON_POLL_INTERVAL = 500;
 async function isDaemonAlive() {
   try {
     const res = await fetch(`${DAEMON_URL}/health`, { signal: AbortSignal.timeout(2000) });
+    if (!res.ok) return false;
     const data = await res.json();
     return data.ok === true;
   } catch {
@@ -70,6 +80,7 @@ function spawnDaemon() {
 
   const child = spawn(process.execPath, [DAEMON_SCRIPT], {
     detached: true,
+    windowsHide: true,
     stdio: 'ignore',
     env: { ...process.env },   // 继承环境变量（含 DAEMON_PORT / BROWSER_HEADLESS 等配置）
   });
@@ -105,6 +116,110 @@ async function ensureDaemon() {
     `Daemon 自动启动超时（${DAEMON_READY_TIMEOUT / 1000}s 内未响应 /health）！\n` +
     `请检查端口 ${config.daemonPort} 是否被占用，或手动运行: npm run daemon`
   );
+}
+
+async function requestJSON(path, { method = 'GET', body, timeoutMs = 5_000 } = {}) {
+  const res = await fetch(`${DAEMON_URL}${path}`, {
+    method,
+    headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
+    body: body === undefined ? undefined : JSON.stringify(body),
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  let data;
+  try { data = await res.json(); }
+  catch (err) { throw new Error(`Daemon ${path} returned invalid JSON: ${err.message}`); }
+  if (!res.ok || data?.ok !== true) {
+    const detail = data?.detail ? ` (${data.detail})` : '';
+    const error = new Error(`Daemon ${path} failed with HTTP ${res.status}: ${data?.error || 'request_failed'}${detail}`);
+    error.status = res.status;
+    error.code = data?.error || 'request_failed';
+    throw error;
+  }
+  return data;
+}
+
+async function acquireSessionLease() {
+  const result = await requestJSON('/session/acquire', {
+    method: 'POST',
+    body: { ownerId: _ownerId, waitMs: SESSION_LEASE_WAIT_MS },
+    timeoutMs: SESSION_LEASE_WAIT_MS + 5_000,
+  });
+  _leaseToken = result.token;
+  _leaseExpiresAt = result.expiresAt;
+  startLeaseRenewal(result.leaseMs || SESSION_LEASE_MS);
+}
+
+async function acquireBrowserEndpoint() {
+  return requestJSON('/browser/acquire', { timeoutMs: config.browserAcquireTimeoutMs });
+}
+
+function startLeaseRenewal(leaseMs) {
+  clearTimeout(_leaseRenewTimer);
+  const renew = async () => {
+    if (!_leaseToken) return;
+    const token = _leaseToken;
+    if (Date.now() >= _leaseExpiresAt - 5_000) {
+      loseSessionLease(token, 'local lease deadline reached');
+      return;
+    }
+    try {
+      const result = await requestJSON('/session/renew', {
+        method: 'POST',
+        body: { token },
+        timeoutMs: Math.min(5_000, Math.floor(leaseMs / 3)),
+      });
+      // A disconnect/new lease may have happened while this request was in flight.
+      if (_leaseToken !== token) return;
+      if (!result.ok) throw new Error('lease renewal rejected');
+      _leaseExpiresAt = result.expiresAt;
+    } catch (err) {
+      if (_leaseToken !== token) return;
+      if (err.status === 409 || Date.now() >= _leaseExpiresAt - 5_000) {
+        loseSessionLease(token, err.message);
+        return;
+      }
+      console.error(`[browser] Session lease renewal failed; retrying before expiry: ${err.message}`);
+    }
+    const untilSafetyDeadline = _leaseExpiresAt - Date.now() - 5_000;
+    const delay = Math.max(1, Math.min(15_000, Math.floor(leaseMs / 4), untilSafetyDeadline));
+    _leaseRenewTimer = setTimeout(renew, delay);
+    _leaseRenewTimer.unref?.();
+  };
+  _leaseRenewTimer = setTimeout(renew, Math.max(1_000, Math.min(15_000, Math.floor(leaseMs / 4))));
+  _leaseRenewTimer.unref?.();
+}
+
+function loseSessionLease(token, reason) {
+  if (_leaseToken !== token) return;
+  _leaseToken = null;
+  _leaseExpiresAt = null;
+  clearTimeout(_leaseRenewTimer);
+  _leaseRenewTimer = null;
+  const browser = _browser;
+  _browser = null;
+
+  const cleanup = async () => {
+    try {
+      if (browser?.isConnected()) await browser.disconnect();
+    } catch (err) {
+      console.error(`[browser] Lost-lease CDP disconnect failed: ${err.message}`);
+    } finally {
+      await releaseSessionLease(token);
+    }
+  };
+  _disconnectPromise = Promise.resolve(_disconnectPromise).then(cleanup).finally(() => {
+    _disconnectPromise = null;
+  });
+  console.error(`[browser] Gemini page lease lost; disconnected the old CDP client (${reason})`);
+}
+
+async function releaseSessionLease(token) {
+  if (!token) return;
+  try {
+    await requestJSON('/session/release', { method: 'POST', body: { token }, timeoutMs: 5_000 });
+  } catch (err) {
+    console.error(`[browser] Session lease release failed; it will expire automatically: ${err.message}`);
+  }
 }
 
 /**
@@ -147,45 +262,65 @@ async function findOrCreateGeminiPage(browser) {
  *
  * @returns {Promise<{browser: import('puppeteer-core').Browser, page: import('puppeteer-core').Page}>}
  */
-export async function ensureBrowser() {
+async function ensureBrowserInternal() {
+  if (_disconnectPromise) await _disconnectPromise;
+
   // 1. 复用已有连接
-  if (_browser && _browser.isConnected()) {
+  if (_browser?.isConnected() && _leaseToken) {
     const page = await findOrCreateGeminiPage(_browser);
     return { browser: _browser, page };
   }
 
-  // 2. 确保 Daemon 可用（未启动则自动拉起）
+  // A lost CDP connection must not leave this process waiting on its stale lease.
+  if (_leaseToken) {
+    const staleToken = _leaseToken;
+    _leaseToken = null;
+    _leaseExpiresAt = null;
+    clearTimeout(_leaseRenewTimer);
+    _leaseRenewTimer = null;
+    await releaseSessionLease(staleToken);
+  }
+  if (_browser && !_browser.isConnected()) _browser = null;
+
+  // Ensure a Daemon is present before taking the cross-process page lease.
   await ensureDaemon();
 
-  // 3. 向 Daemon 索要浏览器连接地址
-  let acquireData;
+  let acquiredToken = null;
   try {
-    console.log(`[browser] 正在呼叫 Daemon: ${DAEMON_URL}/browser/acquire ...`);
-    const res = await fetch(`${DAEMON_URL}/browser/acquire`);
-    acquireData = await res.json();
+    await acquireSessionLease();
+    acquiredToken = _leaseToken;
+    console.log(`[browser] 获得 Gemini 页面 lease (${_ownerId})，正在请求浏览器连接...`);
 
-    if (!acquireData.ok) {
-      const detail = acquireData.detail ? ` (${acquireData.detail})` : '';
-      throw new Error(`${acquireData.error || 'Daemon 返回失败'}${detail}`);
+    const acquireData = await acquireBrowserEndpoint();
+
+    // If the old CDP connection remains valid, reuse it under the newly acquired lease.
+    if (!_browser?.isConnected()) {
+      console.log('[browser] 从 Daemon 获取到 wsEndpoint，正在建立 CDP 直连...');
+      _browser = await puppeteer.connect({
+        browserWSEndpoint: acquireData.wsEndpoint,
+        defaultViewport: null,
+        protocolTimeout: config.browserProtocolTimeout,
+      });
     }
+
+    const page = await findOrCreateGeminiPage(_browser);
+    console.log(`[browser] CDP 直连成功，pid=${acquireData.pid}`);
+    return { browser: _browser, page };
   } catch (err) {
-    throw new Error(
-      `Daemon 已启动但获取浏览器失败！\n` +
-      `底层报错: ${err.message}`
-    );
+    if (_browser && !_browser.isConnected()) _browser = null;
+    clearTimeout(_leaseRenewTimer);
+    _leaseRenewTimer = null;
+    _leaseToken = null;
+    _leaseExpiresAt = null;
+    await releaseSessionLease(acquiredToken);
+    throw new Error(`Daemon 已启动但获取浏览器失败！\n底层报错: ${err.message}`);
   }
+}
 
-  // 4. 拿到 wsEndpoint，通过 WebSocket 直连浏览器
-  console.log(`[browser] 从 Daemon 获取到 wsEndpoint，正在建立 CDP 直连...`);
-  _browser = await puppeteer.connect({
-    browserWSEndpoint: acquireData.wsEndpoint,
-    defaultViewport: null,
-    protocolTimeout: config.browserProtocolTimeout,
-  });
+const ensureBrowserSingleFlight = createSingleFlight(ensureBrowserInternal);
 
-  const page = await findOrCreateGeminiPage(_browser);
-  console.log(`[browser] CDP 直连成功，pid=${acquireData.pid}`);
-  return { browser: _browser, page };
+export function ensureBrowser() {
+  return ensureBrowserSingleFlight();
 }
 
 /**
@@ -195,9 +330,29 @@ export async function ensureBrowser() {
  * 浏览器的生杀大权已经移交给 Daemon 的 TTL 倒计时了。
  */
 export function disconnect() {
-  if (_browser) {
-    _browser.disconnect();
-    _browser = null;
-    console.log('[browser] 已断开 CDP 连接（浏览器仍由 Daemon 守护）');
-  }
+  if (_disconnectPromise) return _disconnectPromise;
+
+  const browser = _browser;
+  const token = _leaseToken;
+  _browser = null;
+  _leaseToken = null;
+  _leaseExpiresAt = null;
+  clearTimeout(_leaseRenewTimer);
+  _leaseRenewTimer = null;
+
+  _disconnectPromise = (async () => {
+    try {
+      if (browser) {
+        // disconnect() drops only this CDP client; it never closes the Daemon-owned browser.
+        await browser.disconnect();
+        console.log('[browser] 已断开 CDP 连接（浏览器仍由 Daemon 守护）');
+      }
+    } finally {
+      // Do not hand the page to another client until the old CDP socket is closed.
+      await releaseSessionLease(token);
+    }
+  })().finally(() => {
+    _disconnectPromise = null;
+  });
+  return _disconnectPromise;
 }
